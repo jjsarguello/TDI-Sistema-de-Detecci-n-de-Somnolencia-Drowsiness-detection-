@@ -1,6 +1,7 @@
 import argparse
 import bz2
 from collections import deque
+import json
 import os
 import platform
 import shutil
@@ -20,6 +21,7 @@ from scipy.spatial import distance as dist
 # Directorio base del script para que funcione sin importar desde qué carpeta se ejecute
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SHAPE_PREDICTOR_URL = "https://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
+PILOT_CONFIG_PATH = os.path.join(SCRIPT_DIR, "piloto_seleccionado.json")
 
 # Intentar importar playsound; si falla, recurrir a reproductores nativos de Windows/macOS/Linux
 try:
@@ -29,6 +31,7 @@ except Exception:
     AUDIO_AVAILABLE = False
 
 ALARM_LOCK = threading.Lock()
+CURRENT_ALARM_PROC = [None]
 
 
 def preprocess_gray_clahe(frame, clahe, use_clahe=True, face_box=None, target_lum=110.0):
@@ -161,26 +164,292 @@ def compute_head_pose_metrics(landmarks):
     )
 
 
-def compute_perspective_compensated_ear(left_ear, right_ear, yaw_ratio, yaw_thresh=0.18):
+def compute_perspective_compensated_ear(
+    left_ear,
+    right_ear,
+    yaw_ratio,
+    left_ear_base=None,
+    right_ear_base=None,
+    yaw_thresh=0.18,
+):
     """
-    Compensa el EAR frente a giros laterales de la cabeza (Yaw):
-      - Cuando el usuario mira de frente (|yaw_ratio| <= yaw_thresh), ambos ojos se ven
-        con igual perspectiva y se usa el promedio simétrico (50% / 50%).
-      - Cuando gira la cara hacia un costado (|yaw_ratio| > yaw_thresh), el ojo más alejado
-        sufre escorzo (se achica por perspectiva dando falsos positivos), mientras que el ojo
-        del lado más ancho (expuesto a la cámara) se ve claramente.
-      - Se pondera con 85% el ojo expuesto a cámara y 15% el ojo en escorzo: así no da falsa
-        alarma al girar la cabeza con ojos abiertos (ej. cobrar un boleto o mirar espejos),
-        pero SÍ detecta si la persona cierra los ojos y se duerme con el cuello girado.
+    Calcula el EAR compensado tanto para calibración en diagonal como ante giros laterales (Yaw):
+      1. Normalización independiente por ojo (left_ear_base, right_ear_base):
+         Si la cámara está ubicada en diagonal al conductor, el ojo más lejano tiene un EAR base
+         menor que el ojo cercano. Al escalar cada ojo respecto a su propia apertura calibrada,
+         ambos ojos quedan equiparados al 100% de apertura en la postura diagonal de manejo.
+      2. Ponderación por ojo expuesto a la cámara según yaw_ratio:
+         Cuando la cara está girada (|yaw_ratio| > yaw_thresh), pondera con 85% el ojo más
+         expuesto a la cámara y 15% el ojo en escorzo. Así evita falsos positivos al girar
+         con ojos abiertos y detecta con precisión si se duerme estando de costado.
     """
+    if (
+        left_ear_base is not None
+        and right_ear_base is not None
+        and left_ear_base > 1e-4
+        and right_ear_base > 1e-4
+    ):
+        mean_base = 0.5 * (left_ear_base + right_ear_base)
+        l_norm = left_ear * (mean_base / left_ear_base)
+        r_norm = right_ear * (mean_base / right_ear_base)
+    else:
+        l_norm = left_ear
+        r_norm = right_ear
+
     if yaw_ratio > yaw_thresh:
         # El lado de left_eye (42-47) está más expuesto hacia la cámara
-        return 0.85 * left_ear + 0.15 * right_ear
+        return 0.85 * l_norm + 0.15 * r_norm
     elif yaw_ratio < -yaw_thresh:
         # El lado de right_eye (36-41) está más expuesto hacia la cámara
-        return 0.85 * right_ear + 0.15 * left_ear
+        return 0.85 * r_norm + 0.15 * l_norm
     else:
-        return (left_ear + right_ear) / 2.0
+        return 0.5 * (l_norm + r_norm)
+
+
+def detect_sunglasses_tdi(frame_bgr, landmarks, yaw_ratio=0.0):
+    """
+    Detecta el uso de lentes de sol (gafas oscuras) mediante Tratamiento Digital de Imágenes
+    (análisis radiométrico comparativo entre la región orbital del lente y la piel del pómulo):
+      - Cuando el conductor cierra los ojos SIN lentes de sol, el párpado tiene tono de piel,
+        por lo que el percentil 68 de la caja orbital mantiene una luminancia cercana a la
+        piel de la mejilla (ratio ~ 0.75 a 1.00).
+      - Cuando usa LENTES DE SOL, el cristal oscuro cubre toda la región orbital, haciendo caer
+        drásticamente el percentil 68 respecto a la mediana de luminancia del pómulo iluminado
+        justo debajo (ratio < 0.58 y diferencia > 26 niveles de gris).
+    Retorna: (tiene_lentes_frame, ratio_orbita_pomulo)
+    """
+    raw_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = raw_gray.shape
+    nose_tip_y = int(landmarks[30][1])
+
+    def _side_ratio(eye_pts, brow_pts):
+        ex_min = int(np.min(eye_pts[:, 0]))
+        ex_max = int(np.max(eye_pts[:, 0]))
+        ey_min = int(np.min(eye_pts[:, 1]))
+        ey_max = int(np.max(eye_pts[:, 1]))
+        by_min = int(np.min(brow_pts[:, 1]))
+
+        eye_w = max(12, ex_max - ex_min)
+        pad_x = int(0.15 * eye_w)
+
+        # ROI orbital (donde se ubica el cristal del lente de sol, desde bajo ceja hasta infra-órbita)
+        ox1 = max(0, ex_min - pad_x)
+        ox2 = min(w, ex_max + pad_x)
+        oy1 = max(0, int(0.35 * by_min + 0.65 * ey_min))
+        oy2 = min(h, int(ey_max + 0.30 * eye_w))
+
+        # ROI del pómulo/mejilla inmediatamente debajo del lente (referencia de iluminación de piel)
+        cx1 = max(0, ex_min)
+        cx2 = min(w, ex_max)
+        cy1 = min(h, int(ey_max + 0.55 * eye_w))
+        cy2 = min(h, max(cy1 + 8, min(nose_tip_y, int(ey_max + 1.25 * eye_w))))
+
+        orb_roi = raw_gray[oy1:oy2, ox1:ox2]
+        cheek_roi = raw_gray[cy1:cy2, cx1:cx2]
+        if orb_roi.size < 25 or cheek_roi.size < 25:
+            return 1.0, 0.0
+
+        # Percentil 68 en órbita (ignora pestañas finas o pequeños brillos) vs mediana en pómulo
+        orb_p68 = float(np.percentile(orb_roi, 68))
+        cheek_p50 = float(np.median(cheek_roi))
+        if cheek_p50 < 38.0:
+            return 1.0, 0.0
+
+        ratio = orb_p68 / max(cheek_p50, 1.0)
+        diff = cheek_p50 - orb_p68
+        return ratio, diff
+
+    # Landmarks: ojo derecho (36-41) + ceja derecha (17-21) | ojo izquierdo (42-47) + ceja izquierda (22-26)
+    r_ratio, r_diff = _side_ratio(landmarks[36:42], landmarks[17:22])
+    l_ratio, l_diff = _side_ratio(landmarks[42:48], landmarks[22:27])
+
+    if yaw_ratio > 0.18:
+        ratio, diff = l_ratio, l_diff
+    elif yaw_ratio < -0.18:
+        ratio, diff = r_ratio, r_diff
+    else:
+        ratio = 0.5 * (l_ratio + r_ratio)
+        diff = 0.5 * (l_diff + r_diff)
+
+    is_dark_lens = (ratio < 0.58) and (diff > 26.0)
+    return is_dark_lens, ratio
+
+
+def load_pilot_anchor(config_path=PILOT_CONFIG_PATH):
+    """
+    Carga desde disco la zona/posición normalizada (nx, ny) seleccionada para el piloto,
+    permitiendo recordar qué lugar corresponde al piloto entre ejecuciones o cambios de conductor.
+    """
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            nx = float(data.get("anchor_nx", 0.5))
+            ny = float(data.get("anchor_ny", 0.5))
+            if 0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0:
+                return (nx, ny)
+        except Exception:
+            pass
+    return None
+
+
+def save_pilot_anchor(anchor_norm, config_path=PILOT_CONFIG_PATH):
+    """
+    Guarda en disco la posición normalizada (nx, ny) donde fue seleccionado el piloto.
+    """
+    if anchor_norm is None:
+        return
+    try:
+        data = {
+            "anchor_nx": round(float(anchor_norm[0]), 4),
+            "anchor_ny": round(float(anchor_norm[1]), 4),
+        }
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def track_subject_face(gray, detector, last_face_box, persistence_counter, max_persistence=25):
+    """
+    Mantiene la referencia espacial del sujeto principal incluso cuando mira en diagonal
+    o se duerme de costado.
+    Retorna: (lista_faces, persistence_counter, modo_persistencia_activo)
+    """
+    pilot_faces, persistence_counter, is_persisted, _, _, _ = detect_and_track_pilot(
+        gray,
+        detector,
+        last_face_box,
+        persistence_counter,
+        pilot_anchor_norm=None,
+        max_persistence=max_persistence,
+    )
+    return pilot_faces, persistence_counter, is_persisted
+
+
+def detect_and_track_pilot(
+    gray,
+    detector,
+    last_face_box,
+    persistence_counter,
+    pilot_anchor_norm=None,
+    max_persistence=25,
+):
+    """
+    Detecta múltiples rostros en cámara, mantiene el seguimiento del PILOTO seleccionado
+    (con persistencia lateral si gira la cabeza) y recuerda la zona seleccionada para el
+    piloto independientemente de si cambia la persona en ese asiento o si hay acompañantes:
+      1. Ordena todos los rostros detectados de izquierda a derecha (#1, #2, ...).
+      2. Si ya venía siguiendo al piloto (last_face_box), busca el rostro que mantiene
+         continuidad espacial dentro de un radio máximo (para NO saltar a un acompañante
+         cuando el piloto gira la cabeza de costado o sale momentáneamente).
+      3. Si el detector frontal pierde el rostro del piloto por giro lateral extremo,
+         activa búsqueda local con upsampling=1 y persistencia por hasta max_persistence
+         frames sin perder la vista de los demás rostros en escena.
+      4. Si el asiento del piloto quedó libre y entra un nuevo piloto (o el mismo regresa)
+         en la zona recordada (pilot_anchor_norm), lo engancha automáticamente como PILOTO.
+    Retorna:
+      (pilot_faces, persistence_counter, is_persisted, all_faces, pilot_idx, pilot_anchor_norm)
+    """
+    h, w = gray.shape
+    raw_faces = list(detector(gray, 0))
+    # Ordenar rostros de izquierda a derecha para numeración estable (#1, #2, ...)
+    all_faces = sorted(raw_faces, key=lambda r: 0.5 * (r.left() + r.right()))
+
+    def _center(r):
+        return 0.5 * (r.left() + r.right()), 0.5 * (r.top() + r.bottom())
+
+    # 1. Si tenemos seguimiento activo del piloto en el frame previo
+    if last_face_box is not None:
+        lx1, ly1, lx2, ly2 = last_face_box
+        prev_cx = 0.5 * (lx1 + lx2)
+        prev_cy = 0.5 * (ly1 + ly2)
+        bw = max(1, lx2 - lx1)
+        bh = max(1, ly2 - ly1)
+        max_jump_dist = max(135.0, 1.15 * max(bw, bh))
+
+        if len(all_faces) > 0:
+            best_idx = None
+            best_dist = float("inf")
+            for idx, r in enumerate(all_faces):
+                cx, cy = _center(r)
+                d = np.hypot(cx - prev_cx, cy - prev_cy)
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = idx
+
+            if best_idx is not None and best_dist <= max_jump_dist:
+                chosen = all_faces[best_idx]
+                if pilot_anchor_norm is None:
+                    cx, cy = _center(chosen)
+                    pilot_anchor_norm = (cx / w, cy / h)
+                return [chosen], 0, False, all_faces, best_idx, pilot_anchor_norm
+
+        # Si el piloto no apareció en la detección directa (o solo se detectaron acompañantes lejos),
+        # aplicar recuperación local / persistencia lateral sobre la posición del piloto
+        if persistence_counter < max_persistence:
+            pad_x = int(0.35 * bw)
+            pad_y = int(0.35 * bh)
+            rx1 = max(0, lx1 - pad_x)
+            ry1 = max(0, ly1 - pad_y)
+            rx2 = min(w, lx2 + pad_x)
+            ry2 = min(h, ly2 + pad_y)
+
+            roi = gray[ry1:ry2, rx1:rx2]
+            if roi.size > 400:
+                sub_faces = detector(roi, 1)
+                if len(sub_faces) > 0:
+                    best_sub = max(
+                        sub_faces,
+                        key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top()),
+                    )
+                    recovered_rect = dlib.rectangle(
+                        rx1 + best_sub.left(),
+                        ry1 + best_sub.top(),
+                        rx1 + best_sub.right(),
+                        ry1 + best_sub.bottom(),
+                    )
+                    return [recovered_rect], persistence_counter + 1, True, all_faces, None, pilot_anchor_norm
+
+            persisted_rect = dlib.rectangle(int(lx1), int(ly1), int(lx2), int(ly2))
+            return [persisted_rect], persistence_counter + 1, True, all_faces, None, pilot_anchor_norm
+
+    # 2. Si no había seguimiento activo (inicio o cambio de piloto tras dejar el asiento libre)
+    if len(all_faces) > 0:
+        if pilot_anchor_norm is not None:
+            ax = pilot_anchor_norm[0] * w
+            ay = pilot_anchor_norm[1] * h
+            best_idx = None
+            best_dist = float("inf")
+            for idx, r in enumerate(all_faces):
+                cx, cy = _center(r)
+                d = np.hypot(cx - ax, cy - ay)
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = idx
+
+            # Si el rostro está dentro de la zona del asiento del piloto (o es el único rostro y está cerca),
+            # seleccionarlo automáticamente aunque haya cambiado la persona del piloto
+            max_anchor_radius = 0.34 * w
+            if best_idx is not None and best_dist <= max_anchor_radius:
+                chosen = all_faces[best_idx]
+                return [chosen], 0, False, all_faces, best_idx, pilot_anchor_norm
+            else:
+                # Hay acompañantes en cámara pero el lugar seleccionado del piloto está vacío
+                return [], persistence_counter, False, all_faces, None, pilot_anchor_norm
+        else:
+            # Primera vez sin selección previa: elegir el rostro de mayor área en primer plano
+            best_idx = max(
+                range(len(all_faces)),
+                key=lambda i: (all_faces[i].right() - all_faces[i].left())
+                * (all_faces[i].bottom() - all_faces[i].top()),
+            )
+            chosen = all_faces[best_idx]
+            cx, cy = _center(chosen)
+            pilot_anchor_norm = (cx / w, cy / h)
+            return [chosen], 0, False, all_faces, best_idx, pilot_anchor_norm
+
+    return [], persistence_counter, False, all_faces, None, pilot_anchor_norm
 
 
 def ema_filter(current_val, prev_val, alpha):
@@ -209,19 +478,38 @@ def classify_eye_state(ear, ear_active_thresh=0.25, ear_sleep_thresh=0.21):
         return 0
 
 
-def update_perclos(history, now_ts, is_closed, window_sec=30.0):
+def update_perclos(history, now_ts, is_closed, window_sec=30.0, min_obs_sec=5.0, max_frame_dt=0.5):
     """
-    Actualiza la ventana deslizante temporal y calcula PERCLOS (%).
-    history: deque de tuplas (timestamp, is_closed) donde is_closed es 1 (cerrado) o 0 (abierto)
-    window_sec: duración de la ventana móvil en segundos
+    Actualiza la ventana deslizante temporal y calcula PERCLOS (%) ponderado por duración real (dt):
+      1. Cada muestra aporta su duración real dt = min(t_i - t_{i-1}, max_frame_dt), eliminando
+         el sesgo por variaciones de FPS.
+      2. Exige un tiempo mínimo de observación efectiva (min_obs_sec, por defecto 5.0 s) tras la
+         calibración para evitar que un único frame o parpadeo inicial dispare PERCLOS al 100%.
     """
-    history.append((now_ts, 1 if is_closed else 0))
+    history.append((float(now_ts), 1 if is_closed else 0))
     while history and (now_ts - history[0][0]) > window_sec:
         history.popleft()
-    if not history:
+    if len(history) < 2:
         return 0.0
-    closed_frames = sum(val for _, val in history)
-    return (closed_frames / len(history)) * 100.0
+
+    closed_duration = 0.0
+    total_duration = 0.0
+    for i in range(1, len(history)):
+        t_prev, _ = history[i - 1]
+        t_curr, closed_curr = history[i]
+        dt = t_curr - t_prev
+        if dt <= 0.0:
+            continue
+        # Acotar dt máximo por si el rostro salió de cuadro y volvió segundos después
+        dt = min(dt, max_frame_dt)
+        total_duration += dt
+        if closed_curr:
+            closed_duration += dt
+
+    if total_duration < min_obs_sec:
+        return 0.0
+
+    return (closed_duration / total_duration) * 100.0
 
 
 def ensure_alarm_wav(path="alarma.wav", sample_rate=44100):
@@ -293,49 +581,64 @@ def ensure_shape_predictor(path):
     return path
 
 
+def stop_alarm():
+    """
+    Detiene inmediatamente cualquier reproducción de alarma en curso apenas el conductor se despierta.
+    """
+    proc = CURRENT_ALARM_PROC[0]
+    if proc is not None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+        CURRENT_ALARM_PROC[0] = None
+
+    if platform.system() == "Windows":
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
+
 def sound_alarm(path):
     """
     Reproduce el archivo 'alarma.wav' en un hilo separado sin bloquear el video,
-    compatible con Windows (winsound), macOS (afplay) y Linux (pw-play / paplay / aplay).
+    compatible con Windows (winsound), macOS (afplay) y Linux (pw-play / paplay / aplay),
+    permitiendo interrumpirlo al instante con stop_alarm() cuando el conductor se despierta.
     """
     if not ALARM_LOCK.acquire(blocking=False):
         return  # Ya hay una alarma sonando actualmente
     try:
         ensure_alarm_wav(path)
         sys_name = platform.system()
-        if AUDIO_AVAILABLE and os.path.exists(path):
-            playsound(path)
-        elif sys_name == "Windows" and os.path.exists(path):
+        cmd = None
+        if sys_name == "Windows" and os.path.exists(path):
             import winsound
-            winsound.PlaySound(path, winsound.SND_FILENAME)
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            time.sleep(0.65)
+            return
         elif sys_name == "Darwin" and shutil.which("afplay") and os.path.exists(path):
-            subprocess.run(
-                ["afplay", path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
+            cmd = ["afplay", path]
         elif shutil.which("pw-play") and os.path.exists(path):
-            subprocess.run(
-                ["pw-play", path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
+            cmd = ["pw-play", path]
         elif shutil.which("paplay") and os.path.exists(path):
-            subprocess.run(
-                ["paplay", path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
+            cmd = ["paplay", path]
         elif shutil.which("aplay") and os.path.exists(path):
-            subprocess.run(
-                ["aplay", "-q", path],
+            cmd = ["aplay", "-q", path]
+
+        if cmd is not None:
+            proc = subprocess.Popen(
+                cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                check=False,
             )
+            CURRENT_ALARM_PROC[0] = proc
+            proc.wait()
+            CURRENT_ALARM_PROC[0] = None
+        elif AUDIO_AVAILABLE and os.path.exists(path):
+            playsound(path)
         else:
             for _ in range(3):
                 print("\a", end="", flush=True)
@@ -343,6 +646,7 @@ def sound_alarm(path):
     except Exception as e:
         print(f"[ERROR] Error reproduciendo audio: {e}")
     finally:
+        CURRENT_ALARM_PROC[0] = None
         ALARM_LOCK.release()
 
 
@@ -399,6 +703,12 @@ def parse_args():
         default=30.0,
         help="Ventana temporal en segundos para el cálculo de PERCLOS (por defecto: 30s)",
     )
+    parser.add_argument(
+        "--alarm-interval",
+        type=float,
+        default=2.0,
+        help="Intervalo en segundos para repetir la alarma mientras persista el sueño/alerta (por defecto: 2.0s)",
+    )
     return parser.parse_args()
 
 
@@ -421,16 +731,17 @@ def main():
     (m_start, m_end) = face_utils.FACIAL_LANDMARKS_IDXS["mouth"]
     (im_start, im_end) = face_utils.FACIAL_LANDMARKS_IDXS["inner_mouth"]
 
-    # Umbrales analíticos de EAR y contadores por estado (fusión de ambos códigos)
+    # Umbrales analíticos de EAR y duraciones en segundos reales con time.monotonic()
+    # (Independientes de los FPS de cada computadora)
     ear_active_thresh = 0.25   # Por encima: Activo
     ear_sleep_thresh = 0.21    # Por debajo: Ojos cerrados (entre 0.21 y 0.25: Somnoliento)
-    drowsy_consec_frames = 10  # Frames consecutivos para declarar fatiga inicial
-    sleep_consec_frames = 15   # Frames consecutivos para declarar sueño / disparar alarma
-    active_consec_frames = 6   # Frames consecutivos para confirmar estado activo
+    drowsy_thresh_sec = 0.40   # Segundos continuos para declarar fatiga inicial (~8-12 frames a 20-30 FPS)
+    sleep_thresh_sec = 0.75    # Segundos continuos para declarar sueño / disparar alarma (~15-22 frames)
+    active_thresh_sec = 0.25   # Segundos continuos para confirmar estado activo
 
-    # Umbral analítico de MAR (Mouth Aspect Ratio) y contadores para bostezo
+    # Umbral analítico de MAR (Mouth Aspect Ratio) y duración para bostezo
     mar_yawn_thresh = 0.50     # Por encima de 0.50: boca ampliamente abierta
-    yawn_consec_frames = 15    # Frames consecutivos para distinguir bostezo de hablar
+    yawn_thresh_sec = 0.60     # Segundos continuos para distinguir bostezo de hablar
 
     # Parámetros y ventana deslizante de PERCLOS (%)
     perclos_window_sec = args.perclos_window
@@ -441,33 +752,58 @@ def main():
     # Umbrales analíticos de postura cefálica (cabeceo hacia abajo e inclinación lateral)
     pitch_nod_thresh = 0.88       # Razón puente_nasal / nariz_mentón indicativa de cabeceo
     roll_tilt_thresh = 16.0       # Inclinación lateral en grados (> 16° hacia un hombro)
-    head_consec_frames = 12       # Frames consecutivos para confirmar cabeceo / inclinación
+    head_thresh_sec = 0.55        # Segundos continuos para confirmar cabeceo / inclinación
 
-    sleep_counter = 0
-    drowsy_counter = 0
-    active_counter = 0
+    sleep_duration = 0.0
+    drowsy_duration = 0.0
+    active_duration = 0.0
 
-    # Contador de parpadeos (transición de ojo cerrado >= 2 frames a ojo abierto)
-    blink_min_frames = 2
-    blink_frame_counter = 0
+    # Contador de parpadeos (transición de ojo cerrado >= 0.05s a ojo abierto)
+    blink_min_sec = 0.05
+    blink_duration = 0.0
     total_blinks = 0
 
-    yawn_counter = 0
+    yawn_duration = 0.0
     total_yawns = 0
     yawn_counted = False
 
-    head_counter = 0
+    head_duration = 0.0
     total_nods = 0
     nod_counted = False
 
-    # Estado de calibración automática inicial (3 segundos mirando al frente, o tecla 'c')
+    # Estado de calibración automática inicial (3 segundos mirando en su postura normal/diagonal, o tecla 'c')
     calibration_duration = 3.0
     is_calibrating = True
     calib_start_ts = None
-    calib_ears = []
+    calib_left_ears = []
+    calib_right_ears = []
     calib_pitches = []
+    calib_rolls = []
+    calib_yaws = []
+
+    left_ear_base = None
+    right_ear_base = None
     ear_base = None
+    pitch_base = None
+    roll_base = 0.0
+    yaw_base = 0.0
+
+    # Estado de seguimiento espacial, selección de piloto multi-rostro y persistencia lateral
     last_face_box = None
+    persistence_counter = 0
+    max_persistence_frames = 25
+    pilot_anchor_norm = load_pilot_anchor()
+    all_detected_faces = []
+    current_pilot_idx = None
+    pending_click_pt = [None]  # Coordenadas (x, y) si el usuario hace click sobre un rostro
+    mirror_camera = True       # Imagen de la cámara invertida horizontalmente (modo espejo)
+
+    if pilot_anchor_norm is not None:
+        print(
+            f"[INFO] Selección de asiento del PILOTO recordada en zona "
+            f"X={pilot_anchor_norm[0]*100:.0f}%, Y={pilot_anchor_norm[1]*100:.0f}% "
+            f"(Click sobre un rostro o tecla 'p' para cambiar de piloto)."
+        )
 
     # Filtro pasa-bajos temporal (EMA) para eliminar jitter (alternable con tecla 'f')
     use_ema = True
@@ -479,28 +815,78 @@ def main():
     ema_roll = None
     ema_yaw = None
 
+    # Detección automática TDI de Lentes de Sol (y modo manual con tecla 'g': AUTO -> ON -> OFF)
+    sunglasses_mode = "AUTO"  # "AUTO", "ON", "OFF"
+    sunglasses_active = False
+    sunglasses_timer = 0.0
+    sunglasses_hysteresis_sec = 0.40  # Segundos (~0.4s) para activar/desactivar sin parpadeos
+
     status = "Iniciando..."
     status_color = (255, 255, 255)
-    alarm_on = False
+    alarm_repeat_interval = max(0.5, float(args.alarm_interval))
+    last_alarm_ts = -1e9
+
+    def _maybe_trigger_alarm(now_mono):
+        nonlocal last_alarm_ts
+        if (now_mono - last_alarm_ts) >= alarm_repeat_interval and not ALARM_LOCK.locked():
+            last_alarm_ts = now_mono
+            threading.Thread(
+                target=sound_alarm, args=(args.alarm,), daemon=True
+            ).start()
+
+    win_main = "Especialista en Descanso - Monitor"
+    win_det = "Result of detector (68 Landmarks)"
+    cv2.namedWindow(win_main)
+    cv2.namedWindow(win_det)
+
+    def _on_mouse_click(event, mx, my, _flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            pending_click_pt[0] = (mx, my)
+
+    cv2.setMouseCallback(win_main, _on_mouse_click)
+    cv2.setMouseCallback(win_det, _on_mouse_click)
 
     print(
         "[INFO] Iniciando captura de video "
-        "(tecla 'c': recalibrar | tecla 'e': CLAHE | tecla 'f': Filtro EMA | 'q'/'ESC': salir)..."
+        "(Click/'p'/'1-9': elegir Piloto | 'c': recalibrar | 'e': CLAHE | 'f': EMA | 'm': espejo | 'q': salir)..."
     )
     cap = open_camera(args.camera)
-    fps_time = time.time()
+    fps_time = time.monotonic()
+    prev_frame_ts = fps_time
+
+    def _select_face_as_pilot(rect, idx_label, frame_w=640, frame_h=480):
+        nonlocal last_face_box, persistence_counter, pilot_anchor_norm
+        rx1, ry1, rx2, ry2 = rect.left(), rect.top(), rect.right(), rect.bottom()
+        last_face_box = (rx1, ry1, rx2, ry2)
+        persistence_counter = 0
+        cx = 0.5 * (rx1 + rx2)
+        cy = 0.5 * (ry1 + ry2)
+        pilot_anchor_norm = (
+             float(np.clip(cx / frame_w, 0.0, 1.0)),
+            float(np.clip(cy / frame_h, 0.0, 1.0)),
+        )
+        save_pilot_anchor(pilot_anchor_norm)
+        print(
+            f"[INFO] Rostro #{idx_label} seleccionado y guardado como PILOTO "
+            f"(zona X={pilot_anchor_norm[0]*100:.0f}%, Y={pilot_anchor_norm[1]*100:.0f}%)."
+        )
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        now_ts = time.time()
+        now_ts = time.monotonic()
+        frame_dt = min(max(now_ts - prev_frame_ts, 0.0), 0.25)
+        prev_frame_ts = now_ts
 
         # Redimensionar para mantener costo computacional uniforme (de CodigoMedium.py)
         frame = cv2.resize(frame, (640, 480))
+        # Invertir horizontalmente la imagen de la cámara (modo espejo por defecto, tecla 'm' para alternar)
+        if mirror_camera:
+            frame = cv2.flip(frame, 1)
 
-        # Preprocesamiento TDI midiendo la luz exclusivamente dentro del rostro detectado
+        # Preprocesamiento TDI midiendo la luz exclusivamente dentro del rostro del piloto
         gray, current_gamma, mean_lum = preprocess_gray_clahe(
             frame, clahe, use_clahe=use_clahe, face_box=last_face_box
         )
@@ -508,28 +894,145 @@ def main():
         # Usar la imagen preprocesada en la ventana del detector para visualizar el efecto de Gamma + CLAHE
         face_frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-        raw_faces = detector(gray, 0)
+        # Detección multi-rostro + seguimiento del PILOTO con memoria de selección y persistencia lateral
+        (
+            faces,
+            persistence_counter,
+            is_persisted,
+            all_detected_faces,
+            current_pilot_idx,
+            pilot_anchor_norm,
+        ) = detect_and_track_pilot(
+            gray,
+            detector,
+            last_face_box,
+            persistence_counter,
+            pilot_anchor_norm=pilot_anchor_norm,
+            max_persistence=max_persistence_frames,
+        )
 
-        # Filtrar para evaluar ÚNICAMENTE a 1 persona: el rostro principal (mayor área = más cercano)
-        if len(raw_faces) > 0:
-            main_face = max(
-                raw_faces,
-                key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top()),
-            )
-            faces = [main_face]
-        else:
-            faces = []
+        # Procesar selección por Click izquierdo del mouse sobre cualquier rostro en cámara
+        if pending_click_pt[0] is not None:
+            mx, my = pending_click_pt[0]
+            pending_click_pt[0] = None
+            if len(all_detected_faces) > 0:
+                chosen_i = None
+                best_d = float("inf")
+                for i, r in enumerate(all_detected_faces):
+                    # Priorizar si el click cayó adentro del recuadro del rostro
+                    if r.left() <= mx <= r.right() and r.top() <= my <= r.bottom():
+                        chosen_i = i
+                        best_d = 0.0
+                        break
+                    rcx = 0.5 * (r.left() + r.right())
+                    rcy = 0.5 * (r.top() + r.bottom())
+                    d = np.hypot(mx - rcx, my - rcy)
+                    if d < best_d:
+                        best_d = d
+                        chosen_i = i
+                if chosen_i is not None and best_d <= 120.0:
+                    chosen_rect = all_detected_faces[chosen_i]
+                    _select_face_as_pilot(chosen_rect, chosen_i + 1)
+                    faces = [chosen_rect]
+                    current_pilot_idx = chosen_i
+                    is_persisted = False
+
+        if not faces:
             last_face_box = None
+            # Si hay una zona de piloto recordada y el asiento está temporalmente vacío, mostrar guía
+            if pilot_anchor_norm is not None:
+                ax = int(pilot_anchor_norm[0] * 640)
+                ay = int(pilot_anchor_norm[1] * 480)
+                gx1, gy1 = max(10, ax - 70), max(40, ay - 70)
+                gx2, gy2 = min(630, ax + 70), min(450, ay + 70)
+                cv2.rectangle(frame, (gx1, gy1), (gx2, gy2), (140, 140, 140), 1)
+                cv2.putText(
+                    frame,
+                    "Zona PILOTO (vacia)",
+                    (gx1, max(55, gy1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (180, 180, 180),
+                    1,
+                )
+
+        # Dibujar los demás rostros detectados (acompañantes / copiloto) en ambas ventanas
+        for idx, other_face in enumerate(all_detected_faces):
+            if idx == current_pilot_idx:
+                continue
+            ox1, oy1, ox2, oy2 = (
+                other_face.left(),
+                other_face.top(),
+                other_face.right(),
+                other_face.bottom(),
+            )
+            other_color = (255, 190, 0)  # Celeste para distinguir acompañantes del piloto
+            label_other = f"Rostro #{idx + 1} [Click/p]"
+            cv2.rectangle(frame, (ox1, oy1), (ox2, oy2), other_color, 1)
+            cv2.putText(
+                frame,
+                label_other,
+                (ox1, max(20, oy1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                other_color,
+                1,
+            )
+            cv2.rectangle(face_frame, (ox1, oy1), (ox2, oy2), other_color, 1)
+            cv2.putText(
+                face_frame,
+                label_other,
+                (ox1, max(45, oy1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                other_color,
+                1,
+            )
 
         for face in faces:
-            # Recuadro del rostro en la vista de detección (de driver_drowsiness.py)
+            # Recuadro del PILOTO en ambas vistas (verde: directo | naranja: persistencia lateral)
             x1, y1, x2, y2 = face.left(), face.top(), face.right(), face.bottom()
-            last_face_box = (x1, y1, x2, y2)
-            cv2.rectangle(face_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            box_color = (0, 165, 255) if is_persisted else (0, 255, 0)
+            pilot_num = (current_pilot_idx + 1) if current_pilot_idx is not None else 1
+            pilot_tag = (
+                f"PILOTO #{pilot_num} (Persistencia {persistence_counter}/{max_persistence_frames})"
+                if is_persisted
+                else f"PILOTO #{pilot_num}"
+            )
+            cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+            cv2.putText(
+                frame,
+                pilot_tag,
+                (x1, max(22, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                box_color,
+                2,
+            )
+            cv2.rectangle(face_frame, (x1, y1), (x2, y2), box_color, 2)
+            cv2.putText(
+                face_frame,
+                pilot_tag,
+                (x1, max(45, y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                box_color,
+                2,
+            )
 
             # Extracción de los 68 landmarks
             shape = predictor(gray, face)
             landmarks = face_utils.shape_to_np(shape)
+
+            # Actualizar last_face_box: si está en persistencia lateral, seguir suavemente el centroide de landmarks
+            if is_persisted:
+                bw, bh = x2 - x1, y2 - y1
+                lm_cx, lm_cy = np.mean(landmarks[:, 0]), np.mean(landmarks[:, 1])
+                nx1 = int(0.7 * x1 + 0.3 * (lm_cx - 0.5 * bw))
+                ny1 = int(0.7 * y1 + 0.3 * (lm_cy - 0.5 * bh))
+                last_face_box = (nx1, ny1, nx1 + bw, ny1 + bh)
+            else:
+                last_face_box = (x1, y1, x2, y2)
 
             # Extraer regiones oculares y calcular EAR individual de cada ojo
             left_eye = landmarks[l_start:l_end]
@@ -552,9 +1055,14 @@ def main():
                 pt_chin,
             ) = compute_head_pose_metrics(landmarks)
 
-            # Calcular EAR instantáneo compensado por perspectiva ante giros laterales (Yaw)
+            # Calcular EAR instantáneo con calibración independiente por ojo y compensación por giro (Yaw)
             ear_raw = compute_perspective_compensated_ear(
-                left_ear, right_ear, yaw_raw, yaw_thresh=0.18
+                left_ear,
+                right_ear,
+                yaw_raw,
+                left_ear_base=left_ear_base,
+                right_ear_base=right_ear_base,
+                yaw_thresh=0.18,
             )
 
             # Actualizar filtro pasa-bajos temporal (EMA) y elegir señales según use_ema (tecla 'f')
@@ -577,14 +1085,33 @@ def main():
                 roll_deg = roll_raw
                 yaw_ratio = yaw_raw
 
-            # Fase de calibración personalizada (3 segundos iniciales o al presionar 'c')
+            # Detección de Lentes de Sol (TDI radiométrico Órbita vs. Pómulo + control con tecla 'g')
+            raw_has_sunglasses, _sg_ratio = detect_sunglasses_tdi(frame, landmarks, yaw_ratio=yaw_ratio)
+            if sunglasses_mode == "ON":
+                sunglasses_active = True
+            elif sunglasses_mode == "OFF":
+                sunglasses_active = False
+            else:
+                if raw_has_sunglasses:
+                    sunglasses_timer = min(sunglasses_hysteresis_sec, sunglasses_timer + frame_dt)
+                    if sunglasses_timer >= sunglasses_hysteresis_sec:
+                        sunglasses_active = True
+                else:
+                    sunglasses_timer = max(-sunglasses_hysteresis_sec, sunglasses_timer - frame_dt)
+                    if sunglasses_timer <= -sunglasses_hysteresis_sec:
+                        sunglasses_active = False
+
+            # Fase de calibración personalizada (3 segundos en postura normal/diagonal o al presionar 'c')
             if is_calibrating:
                 if calib_start_ts is None:
                     calib_start_ts = now_ts
                 elapsed_calib = now_ts - calib_start_ts
-                if ear_raw > 0.16:  # Descartar si justo parpadeó durante la toma de muestras
-                    calib_ears.append(ear_raw)
+                if not sunglasses_active and left_ear > 0.14 and right_ear > 0.14:
+                    calib_left_ears.append(left_ear)
+                    calib_right_ears.append(right_ear)
                 calib_pitches.append(pitch_raw)
+                calib_rolls.append(roll_raw)
+                calib_yaws.append(yaw_raw)
 
                 progress = min(elapsed_calib / calibration_duration, 1.0)
                 status = f"CALIBRANDO... {int(progress * 100)}%"
@@ -601,99 +1128,129 @@ def main():
                 )
                 cv2.putText(
                     frame,
-                    "Mira al frente normalmente (3s)",
+                    "Mira en tu postura normal de manejo (3s)",
                     (10, 90),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
+                    0.58,
                     (255, 255, 0),
                     2,
                 )
 
-                if elapsed_calib >= calibration_duration and len(calib_ears) >= 5:
-                    ear_base = float(np.median(calib_ears))
+                if elapsed_calib >= calibration_duration and len(calib_pitches) >= 5:
+                    if len(calib_left_ears) >= 5:
+                        left_ear_base = float(np.median(calib_left_ears))
+                        right_ear_base = float(np.median(calib_right_ears))
+                        ear_base = 0.5 * (left_ear_base + right_ear_base)
+                        ear_active_thresh = round(ear_base * 0.82, 3)
+                        ear_sleep_thresh = round(ear_base * 0.70, 3)
                     pitch_base = float(np.median(calib_pitches))
-                    # Ajustar umbrales proporcionales a la fisonomía del usuario
-                    ear_active_thresh = round(ear_base * 0.82, 3)
-                    ear_sleep_thresh = round(ear_base * 0.70, 3)
+                    roll_base = float(np.median(calib_rolls))
+                    yaw_base = float(np.median(calib_yaws))
                     pitch_nod_thresh = round(pitch_base * 1.25, 3)
+
                     is_calibrating = False
                     perclos_history.clear()
-                    sleep_counter = drowsy_counter = active_counter = 0
+                    sleep_duration = drowsy_duration = active_duration = 0.0
                     print(
-                        f"[INFO] Calibración completada -> EAR base: {ear_base:.3f} | "
-                        f"Umbral Activo: {ear_active_thresh:.3f} | "
-                        f"Umbral Cerrado: {ear_sleep_thresh:.3f} | "
-                        f"Umbral Pitch: {pitch_nod_thresh:.3f}"
+                        f"[INFO] Calibración completada -> "
+                        f"Cero Postural: Pitch0={pitch_base:.2f}, Roll0={roll_base:+.1f}°, Yaw0={yaw_base:+.2f} | "
+                        f"Umb EAR: {ear_active_thresh:.3f}/{ear_sleep_thresh:.3f}"
                     )
 
-            head_anomaly = (pitch_ratio > pitch_nod_thresh) or (abs(roll_deg) > roll_tilt_thresh)
+            # Desviaciones posturales respecto al "cero relativo" calibrado (soporta cámara en diagonal)
+            delta_roll = roll_deg - roll_base
+            delta_yaw = yaw_ratio - yaw_base
+            head_anomaly = (pitch_ratio > pitch_nod_thresh) or (abs(delta_roll) > roll_tilt_thresh)
 
-            # Clasificar apertura ocular para fatiga/sueño (con EAR suavizado o crudo según 'f')
-            eye_state = classify_eye_state(ear, ear_active_thresh, ear_sleep_thresh)
-            # Para el contador de parpadeos usamos SIEMPRE ear_raw (instantáneo) para no perder parpadeos rápidos
-            eye_closed_raw = classify_eye_state(ear_raw, ear_active_thresh, ear_sleep_thresh) == 0
-            eye_closed = (eye_state == 0)
-
-            # Conteo de parpadeos y actualización de PERCLOS (solo una vez terminada la calibración)
-            if not is_calibrating:
-                if eye_closed_raw:
-                    blink_frame_counter += 1
-                else:
-                    if blink_frame_counter >= blink_min_frames:
-                        total_blinks += 1
-                    blink_frame_counter = 0
-
-                perclos = update_perclos(perclos_history, now_ts, eye_closed, perclos_window_sec)
-            else:
+            # Si se detectan LENTES DE SOL: ignorar medición ocular (EAR / PERCLOS)
+            # y tomar como válidas únicamente la posición del rostro (Pitch/dRoll) y el bostezo (MAR)
+            if sunglasses_active:
+                eye_state = 2
+                eye_closed_raw = False
+                eye_closed = False
+                sleep_duration = 0.0
+                drowsy_duration = 0.0
+                blink_duration = 0.0
                 perclos = 0.0
+                if not is_calibrating:
+                    if head_duration >= head_thresh_sec:
+                        status = "SOMNOLENCIA (POSTURA)!"
+                        status_color = (0, 0, 255)
+                    elif yawn_duration >= yawn_thresh_sec:
+                        status = "FATIGA (BOSTEZO)!"
+                        status_color = (0, 0, 255)
+                    elif head_anomaly or mar > mar_yawn_thresh:
+                        status = "Atencion (Postura/Boca)"
+                        status_color = (0, 165, 255)
+                    else:
+                        status = "Activo [Lentes de Sol]"
+                        status_color = (0, 255, 0)
+            else:
+                # Clasificar apertura ocular para fatiga/sueño (con EAR suavizado o crudo según 'f')
+                eye_state = classify_eye_state(ear, ear_active_thresh, ear_sleep_thresh)
+                # Para el contador de parpadeos usamos SIEMPRE ear_raw (instantáneo) para no perder parpadeos rápidos
+                eye_closed_raw = classify_eye_state(ear_raw, ear_active_thresh, ear_sleep_thresh) == 0
+                eye_closed = (eye_state == 0)
 
-            # Evaluación temporal combinando cierre continuo (EAR compensado) y fatiga acumulada (PERCLOS)
-            if not is_calibrating:
-                if eye_closed:
-                    sleep_counter += 1
-                    drowsy_counter = 0
-                    active_counter = 0
-                elif eye_state == 1:
-                    sleep_counter = 0
-                    active_counter = 0
-                    drowsy_counter += 1
+                # Conteo de parpadeos y actualización de PERCLOS en segundos reales
+                if not is_calibrating:
+                    if eye_closed_raw:
+                        blink_duration += frame_dt
+                    else:
+                        if blink_duration >= blink_min_sec:
+                            total_blinks += 1
+                        blink_duration = 0.0
+
+                    perclos = update_perclos(perclos_history, now_ts, eye_closed, perclos_window_sec)
                 else:
-                    drowsy_counter = 0
-                    sleep_counter = 0
-                    active_counter += 1
+                    perclos = 0.0
 
-                if sleep_counter >= sleep_consec_frames or perclos >= perclos_sleep_thresh:
-                    status = (
-                        "DURMIENDO !!!"
-                        if sleep_counter >= sleep_consec_frames
-                        else "SOMNOLENCIA (PERCLOS)!"
-                    )
-                    status_color = (0, 0, 255)  # Rojo en BGR
-                    if not alarm_on:
-                        alarm_on = True
-                        threading.Thread(
-                            target=sound_alarm, args=(args.alarm,), daemon=True
-                        ).start()
+                # Evaluación temporal en segundos reales (time.monotonic) combinando cierre continuo y PERCLOS
+                if not is_calibrating:
+                    if eye_closed:
+                        sleep_duration += frame_dt
+                        drowsy_duration = 0.0
+                        active_duration = 0.0
+                    elif eye_state == 1:
+                        sleep_duration = 0.0
+                        active_duration = 0.0
+                        drowsy_duration += frame_dt
+                    else:
+                        drowsy_duration = 0.0
+                        sleep_duration = 0.0
+                        active_duration += frame_dt
 
-                elif drowsy_counter >= drowsy_consec_frames or perclos >= perclos_drowsy_thresh:
-                    status = "Somnoliento (Fatiga) !"
-                    status_color = (0, 165, 255)  # Naranja en BGR
-                    if mar <= mar_yawn_thresh and not head_anomaly:
-                        alarm_on = False
+                    # La alarma ocular suena si hay cierre sostenido actual (sleep_duration >= sleep_thresh_sec)
+                    # o si PERCLOS es crítico MIENTRAS los ojos siguen cerrados/entrecerrados (eye_state < 2).
+                    # Apenas el conductor abre bien los ojos (eye_state == 2), la alarma se detiene.
+                    if sleep_duration >= sleep_thresh_sec or (
+                        perclos >= perclos_sleep_thresh and eye_state < 2
+                    ):
+                        status = (
+                            "DURMIENDO !!!"
+                            if sleep_duration >= sleep_thresh_sec
+                            else "SOMNOLENCIA (PERCLOS)!"
+                        )
+                        status_color = (0, 0, 255)  # Rojo en BGR
+                        _maybe_trigger_alarm(now_ts)
 
-                else:
-                    if mar <= mar_yawn_thresh and not head_anomaly:
-                        alarm_on = False
-                    if active_counter >= active_consec_frames:
-                        status = "Activo :)"
-                        status_color = (0, 255, 0)  # Verde en BGR
+                    elif drowsy_duration >= drowsy_thresh_sec or (
+                        perclos >= perclos_drowsy_thresh and eye_state < 2
+                    ):
+                        status = "Somnoliento (Fatiga) !"
+                        status_color = (0, 165, 255)  # Naranja en BGR
 
-            # Evaluación temporal de bostezo mediante MAR
+                    else:
+                        if active_duration >= active_thresh_sec:
+                            status = "Activo :)"
+                            status_color = (0, 255, 0)  # Verde en BGR
+
+            # Evaluación temporal de bostezo mediante MAR en segundos reales
             mouth_color = (255, 0, 0)  # Azul por defecto
             if mar > mar_yawn_thresh:
-                yawn_counter += 1
+                yawn_duration += frame_dt
                 mouth_color = (0, 165, 255)  # Naranja mientras abre la boca
-                if yawn_counter >= yawn_consec_frames:
+                if yawn_duration >= yawn_thresh_sec:
                     mouth_color = (0, 0, 255)  # Rojo al confirmar bostezo
                     if not yawn_counted:
                         total_yawns += 1
@@ -707,21 +1264,17 @@ def main():
                         (0, 0, 255),
                         2,
                     )
-                    if not alarm_on:
-                        alarm_on = True
-                        threading.Thread(
-                            target=sound_alarm, args=(args.alarm,), daemon=True
-                        ).start()
+                    _maybe_trigger_alarm(now_ts)
             else:
-                yawn_counter = 0
+                yawn_duration = 0.0
                 yawn_counted = False
 
-            # Evaluación temporal de cabeceo (Pitch) e inclinación lateral (Roll)
+            # Evaluación temporal de cabeceo (Pitch) e inclinación lateral (Roll) en segundos reales
             axis_color = (255, 255, 0)  # Cian por defecto para el eje facial
             if head_anomaly:
-                head_counter += 1
+                head_duration += frame_dt
                 axis_color = (0, 165, 255)  # Naranja mientras empieza a inclinar/cabecear
-                if head_counter >= head_consec_frames:
+                if head_duration >= head_thresh_sec:
                     axis_color = (0, 0, 255)  # Rojo al confirmar postura anómala
                     if not nod_counted:
                         total_nods += 1
@@ -740,17 +1293,27 @@ def main():
                         (0, 0, 255),
                         2,
                     )
-                    if not alarm_on:
-                        alarm_on = True
-                        threading.Thread(
-                            target=sound_alarm, args=(args.alarm,), daemon=True
-                        ).start()
+                    _maybe_trigger_alarm(now_ts)
             else:
-                head_counter = 0
+                head_duration = 0.0
                 nod_counted = False
 
-            # Visualización de contornos de ojos (resaltando el ojo expuesto a cámara si hay giro Yaw)
-            if yaw_ratio > 0.18:
+            # Si el conductor ya se despertó (ojos abiertos, sin bostezo ni cabeceo activo),
+            # cortar de inmediato cualquier sonido de alarma que estuviera reproduciéndose
+            eye_alarm_active = (not sunglasses_active) and (
+                sleep_duration >= sleep_thresh_sec
+                or (perclos >= perclos_sleep_thresh and eye_state < 2)
+            )
+            yawn_alarm_active = yawn_duration >= yawn_thresh_sec
+            head_alarm_active = head_duration >= head_thresh_sec
+            if not (eye_alarm_active or yawn_alarm_active or head_alarm_active):
+                stop_alarm()
+
+            # Visualización de contornos de ojos (violeta si usa lentes de sol, o verde según ojo expuesto)
+            if sunglasses_active:
+                left_eye_color = (220, 100, 180)
+                right_eye_color = (220, 100, 180)
+            elif yaw_ratio > 0.18:
                 left_eye_color = (0, 255, 0)      # Ojo izquierdo dominante (frente a cámara)
                 right_eye_color = (160, 160, 100) # Ojo derecho en escorzo (menor peso)
             elif yaw_ratio < -0.18:
@@ -783,19 +1346,30 @@ def main():
                 status,
                 (10, 35),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
+                0.85,
                 status_color,
                 2,
             )
-            cv2.putText(
-                frame,
-                f"EAR: {ear:.2f}",
-                (450, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 255),
-                2,
-            )
+            if sunglasses_active:
+                cv2.putText(
+                    frame,
+                    "EAR: LENTES (Pausado)",
+                    (415, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (220, 120, 255),
+                    2,
+                )
+            else:
+                cv2.putText(
+                    frame,
+                    f"EAR: {ear:.2f}",
+                    (450, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 255, 255),
+                    2,
+                )
             cv2.putText(
                 frame,
                 f"MAR: {mar:.2f}",
@@ -816,19 +1390,24 @@ def main():
             )
 
             # Color dinámico e indicador visual para PERCLOS
-            if perclos >= perclos_sleep_thresh:
-                perclos_color = (0, 0, 255)
-            elif perclos >= perclos_drowsy_thresh:
-                perclos_color = (0, 165, 255)
+            if sunglasses_active:
+                perclos_color = (180, 180, 180)
+                perclos_text = "PERCLOS: Pausado"
             else:
-                perclos_color = (0, 255, 0)
+                if perclos >= perclos_sleep_thresh:
+                    perclos_color = (0, 0, 255)
+                elif perclos >= perclos_drowsy_thresh:
+                    perclos_color = (0, 165, 255)
+                else:
+                    perclos_color = (0, 255, 0)
+                perclos_text = f"PERCLOS: {perclos:.1f}%"
 
             cv2.putText(
                 frame,
-                f"PERCLOS: {perclos:.1f}%",
-                (450, 125),
+                perclos_text,
+                (435 if sunglasses_active else 450, 125),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
+                0.55 if sunglasses_active else 0.65,
                 perclos_color,
                 2,
             )
@@ -845,7 +1424,7 @@ def main():
                     -1,
                 )
 
-            # Métricas de Postura Cefálica (Pitch, Roll, Yaw y contador de cabeceos)
+            # Métricas de Postura Cefálica (Pitch, dRoll relativo, Yaw con dYaw y contador de cabeceos)
             cv2.putText(
                 frame,
                 f"Pitch: {pitch_ratio:.2f}",
@@ -857,7 +1436,7 @@ def main():
             )
             cv2.putText(
                 frame,
-                f"Roll: {roll_deg:+.1f} deg",
+                f"dRoll: {delta_roll:+.1f} deg",
                 (450, 195),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
@@ -867,10 +1446,10 @@ def main():
             yaw_color = (0, 255, 255) if abs(yaw_ratio) > 0.18 else (200, 200, 200)
             cv2.putText(
                 frame,
-                f"Yaw (Giro): {yaw_ratio:+.2f}",
-                (450, 220),
+                f"Yaw:{yaw_ratio:+.2f} d:{delta_yaw:+.2f}",
+                (435, 220),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.55,
                 yaw_color,
                 2,
             )
@@ -902,16 +1481,34 @@ def main():
                 1,
             )
 
-        # Cálculo y visualización de FPS e indicadores de controles ('c', 'e', 'f')
-        now = time.time()
+        # Indicador de cantidad de rostros detectados, selección de Piloto y estado de Lentes de Sol
+        num_faces = len(all_detected_faces)
+        sg_tag = f"Lentes:{'SI' if sunglasses_active else 'NO'}({sunglasses_mode}[g])"
+        pilot_str = (
+            f"Rostros:{num_faces} | Piloto:#{current_pilot_idx + 1} [Click/p] | {sg_tag}"
+            if current_pilot_idx is not None
+            else f"Rostros:{num_faces} | [Click/p] Piloto | {sg_tag}"
+        )
+        cv2.putText(
+            frame,
+            pilot_str,
+            (10, 435),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (220, 120, 255) if sunglasses_active else ((0, 255, 255) if num_faces > 1 else (200, 200, 200)),
+            1,
+        )
+
+        # Cálculo y visualización de FPS e indicadores de controles ('c', 'e', 'f', 'p', 'm', 'g')
+        now = time.monotonic()
         fps = 1.0 / max(now - fps_time, 1e-6)
         fps_time = now
         cv2.putText(
             frame,
-            f"FPS: {fps:.1f} | [c]Calib",
+            f"FPS: {fps:.1f} | [c]Calib | [m]Espejo",
             (10, 460),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
+            0.5,
             (0, 255, 0),
             2,
         )
@@ -921,9 +1518,9 @@ def main():
         cv2.putText(
             frame,
             ema_label,
-            (215, 460),
+            (270, 460),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
+            0.5,
             ema_color,
             2,
         )
@@ -933,9 +1530,9 @@ def main():
         cv2.putText(
             frame,
             clahe_label,
-            (360, 460),
+            (395, 460),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
+            0.5,
             clahe_color,
             2,
         )
@@ -950,12 +1547,31 @@ def main():
         )
 
         # Mostrar ambas vistas: monitor principal y detector de landmarks sobre imagen preprocesada
-        cv2.imshow("Especialista en Descanso - Monitor", frame)
-        cv2.imshow("Result of detector (68 Landmarks)", face_frame)
+        cv2.imshow(win_main, frame)
+        cv2.imshow(win_det, face_frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q") or key == 27:  # 'q' o tecla ESC
             break
+        elif key == ord("g"):
+            modes = ["AUTO", "ON", "OFF"]
+            sunglasses_mode = modes[(modes.index(sunglasses_mode) + 1) % len(modes)]
+            print(f"[INFO] Modo Lentes de Sol: {sunglasses_mode}")
+        elif key == ord("m"):
+            mirror_camera = not mirror_camera
+            print(f"[INFO] Modo espejo de cámara: {'ACTIVADO' if mirror_camera else 'DESACTIVADO'}")
+        elif key == ord("p") or key == 9:  # 'p' o Tab: alternar cuál rostro es el Piloto
+            if len(all_detected_faces) > 0:
+                next_idx = (
+                    0
+                    if current_pilot_idx is None
+                    else (current_pilot_idx + 1) % len(all_detected_faces)
+                )
+                _select_face_as_pilot(all_detected_faces[next_idx], next_idx + 1)
+        elif ord("1") <= key <= ord("9"):
+            sel_idx = key - ord("1")
+            if sel_idx < len(all_detected_faces):
+                _select_face_as_pilot(all_detected_faces[sel_idx], sel_idx + 1)
         elif key == ord("e"):
             use_clahe = not use_clahe
         elif key == ord("f"):
@@ -963,13 +1579,18 @@ def main():
             state_str = "ACTIVADO (estabilidad)" if use_ema else "DESACTIVADO (máxima sensibilidad)"
             print(f"[INFO] Filtro EMA {state_str}")
         elif key == ord("c"):
-            # Reiniciar calibración personalizada de 3 segundos
+            # Reiniciar calibración personalizada de 3 segundos (ambos ojos + cero postural 3D)
+            stop_alarm()
             is_calibrating = True
             calib_start_ts = None
-            calib_ears.clear()
+            calib_left_ears.clear()
+            calib_right_ears.clear()
             calib_pitches.clear()
-            print("[INFO] Recalibrando umbrales por 3 segundos...")
+            calib_rolls.clear()
+            calib_yaws.clear()
+            print("[INFO] Recalibrando umbrales y cero postural 3D por 3 segundos...")
 
+    stop_alarm()
     cap.release()
     cv2.destroyAllWindows()
 

@@ -2,9 +2,13 @@
 *.dat
 *.bz2
 
+# Configuración local de selección de piloto
+piloto_seleccionado.json
+
 # Entornos virtuales y caché de Python
 .venv/
 venv/
 __pycache__/
 *.pyc
+
 

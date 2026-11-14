@@ -96,36 +96,49 @@ D) DETECCIÓN DE BOSTEZOS: mouth_aspect_ratio() (MÉTRICA MAR)
      incrementando el contador de "Bostezos" y disparando una alerta.
 
 
-E) POSTURA CEFÁLICA EN 3 EJES Y COMPENSACIÓN DE GIRO:
-   compute_head_pose_metrics() y compute_perspective_compensated_ear()
+E) POSTURA CEFÁLICA EN 3 EJES, COMPENSACIÓN POR OJO Y PERSISTENCIA LATERAL:
+   compute_head_pose_metrics(), compute_perspective_compensated_ear() y track_subject_face()
    -----------------------------------------------------------------------------
    * ¿Qué hace?
-     1. Roll (Inclinación lateral en grados): calcula el ángulo de la línea que
-        une el centro de ambos ojos. Si supera ±16°, detecta que la cabeza cayó
-        hacia un hombro.
-     2. Pitch (Cabeceo vertical): calcula la razón proyectiva entre el largo del
-        puente nasal (entrecejo p27 a punta de nariz p30) y la distancia nariz-
-        mentón (p30 a p8). Al cabecear hacia adelante/abajo, la distancia nariz-
-        mentón se acorta en la proyección 2D de la cámara y el ratio sube,
-        disparando la alerta de cabeceo y sumando al contador "Cabeceos".
-     3. Yaw (Giro lateral del cuello): compara el ancho visible izquierdo vs.
-        derecho del rostro desde la nariz (p30) hacia los bordes de la mandíbula
-        (p0 y p16).
-     4. Compensación de EAR por perspectiva (compute_perspective_compensated_ear):
-        Cuando el usuario gira la cabeza hacia un costado (|Yaw| > 0.18), el ojo
-        más alejado se achica por perspectiva (escorzo), mientras que el ojo
-        expuesto hacia la cámara se ve claramente. El sistema le asigna 85% de
-        peso al ojo expuesto a la cámara (pintándolo en verde brillante) y 15%
-        al ojo en escorzo (pintándolo en gris).
+     1. Roll (Inclinación lateral relativa en grados, dRoll = Roll - Roll_0):
+        calcula el ángulo de la línea que une el centro de ambos ojos respecto
+        al ángulo base de calibración (Roll_0). Si |dRoll| supera ±16°, detecta
+        que la cabeza cayó hacia un hombro sin importar si la cámara está en el
+        parante o tablero.
+     2. Pitch (Cabeceo vertical relativo a Pitch_0): calcula la razón proyectiva
+        entre el largo del puente nasal (entrecejo p27 a punta de nariz p30) y la
+        distancia nariz-mentón (p30 a p8). Al cabecear hacia adelante/abajo, la
+        distancia nariz-mentón se acorta en la proyección 2D de la cámara y el
+        ratio supera el 125% de Pitch_0, disparando la alerta de cabeceo.
+     3. Yaw (Giro lateral del cuello y desvío dYaw = Yaw - Yaw_0): compara el
+        ancho visible izquierdo vs. derecho del rostro desde la nariz (p30) hacia
+        los bordes de la mandíbula (p0 y p16).
+     4. Normalización individual por ojo + Compensación de perspectiva
+        (compute_perspective_compensated_ear):
+        Primero normaliza cada ojo respecto a su propia apertura de calibración
+        (left_ear_base y right_ear_base), eliminando la asimetría fija cuando la
+        cámara apunta en diagonal. Luego, si la cabeza está de costado respecto
+        a la cámara (|Yaw| > 0.18), asigna 85% de peso al ojo expuesto a la
+        cámara (verde brillante) y 15% al ojo en escorzo (gris).
+     5. Seguimiento espacial y persistencia lateral (track_subject_face):
+        - Prioriza al sujeto principal combinando área en primer plano y cercanía
+          al centroide previo del conductor.
+        - Si el detector frontal HOG de dlib pierde momentáneamente la cara por
+          un giro brusco o cabeceo de perfil, intenta recuperar el rostro con
+          búsqueda local y upsampling en la ROI previa (detector(roi, 1)) y, si
+          aún no lo detecta, mantiene el rectángulo de referencia durante hasta
+          25 frames (~1 seg) siguiendo el centroide de los 68 landmarks.
 
    * ¿Cuál es su utilidad?
-     Resuelve un problema clásico de conducción real:
-     - Si el conductor gira la cabeza con los ojos abiertos (ej. para cobrar un
-       pasaje o mirar un espejo), NO dispara falsos positivos por culpa del ojo
-       que quedó de perfil.
-     - Pero si el conductor se queda dormido con el cuello girado hacia un
-       costado, el ojo visible hacia la cámara también se cierra y el sistema
-       DETECTA el sueño sin fallar.
+     Resuelve el escenario real donde la cámara no está frente al volante o el
+     conductor se duerme de costado:
+     - Si se calibra mirando en diagonal, cada ojo tiene su propia referencia y
+       el cero postural 3D (Pitch_0, Roll_0, Yaw_0) queda anclado a esa diagonal.
+     - Si el conductor gira la cabeza con los ojos abiertos, NO dispara falsos
+       positivos.
+     - Si el conductor se queda dormido de costado o cabecea en diagonal, el
+       sistema mantiene la referencia del sujeto (recuadro naranja de persistencia
+       lateral) y detecta el cierre ocular y postural sin perder el rastreo.
 
 
 F) FILTRO PASA-BAJOS TEMPORAL (EMA): ema_filter()
@@ -147,16 +160,19 @@ F) FILTRO PASA-BAJOS TEMPORAL (EMA): ema_filter()
      entre máxima estabilidad (EMA ON) o cero latencia (EMA OFF).
 
 
-G) CALIBRACIÓN AUTOMÁTICA INICIAL (3 SEGUNDOS) Y CONTADOR DE PARPADEOS
+G) CALIBRACIÓN INDEPENDIENTE POR OJO + CERO POSTURAL 3D (3 SEGUNDOS) Y PARPADEOS
    -----------------------------------------------------------------------------
    * ¿Qué hace?
      - Durante los primeros 3 segundos en los que detecta al usuario (o al tocar
-       la tecla 'c'), mide la mediana de apertura ocular normal (EAR_base) y la
-       postura frontal (Pitch_base).
-     - Fija automáticamente los umbrales analíticos personalizados:
+       la tecla 'c'), mide por separado la mediana de apertura de cada ojo
+       (EAR_L0 y EAR_R0) y el cero postural en los 3 ejes (Pitch_0, Roll_0, Yaw_0),
+       incluso si el conductor mira en diagonal a la cámara.
+     - Fija automáticamente los umbrales analíticos personalizados sobre el EAR
+       medio normalizado:
          * Umbral Activo (ear_active_thresh) = 82% de EAR_base
          * Umbral Ojo Cerrado (ear_sleep_thresh) = 70% de EAR_base
-         * Umbral de Cabeceo (pitch_nod_thresh) = 125% de Pitch_base
+         * Umbral de Cabeceo (pitch_nod_thresh) = 125% de Pitch_0
+         * Umbral de Inclinación Lateral = |Roll - Roll_0| > 16°
      - Además, cada vez que el ojo se cierra por >= 2 frames y vuelve a abrirse,
        incrementa el contador de "Parpadeos".
 
@@ -200,8 +216,32 @@ I) ALARMA SONORA MULTIHILO: sound_alarm() y ensure_alarm_wav()
      múltiples audios a la vez.
 
 
+J) DETECCIÓN RADIOMÉTRICA DE LENTES DE SOL (TDI): detect_sunglasses_tdi()
+   -----------------------------------------------------------------------------
+   * ¿Qué hace?
+     Compara en la imagen en escala de grises cruda (previa a CLAHE) el percentil
+     68 de luminancia dentro de la región orbital (donde se ubica el cristal del
+     lente, entre ceja y párpado inferior) frente a la mediana de luminancia de
+     la piel del pómulo inmediatamente debajo:
+     - Cuando el conductor cierra los ojos SIN lentes de sol, el párpado tiene
+       tono de piel, por lo que el percentil 68 de la caja orbital mantiene un
+       brillo cercano al del pómulo (ratio ~ 0.75 a 1.00).
+     - Con LENTES DE SOL, el cristal oscuro cubre toda la caja orbital y el ratio
+       Órbita/Pómulo cae por debajo de 0.58 (con más de 26 niveles de gris de
+       diferencia).
+     - Al confirmarse durante 10 frames (~0.35s) o activarse con la tecla 'g',
+       el sistema pausa la medición de ojos (EAR y PERCLOS) y evalúa la
+       somnolencia exclusivamente mediante la Postura 3D del rostro (Pitch /
+       dRoll) y el Bostezo (MAR).
+
+
 3. RESUMEN DE CONTROLES INTERACTIVOS EN TIEMPO REAL
 --------------------------------------------------------------------------------
+  * Click izquierdo : Selecciona el rostro clickeado como PILOTO y guarda su zona.
+  * Tecla 'p' o Tab : Alterna la selección de PILOTO entre los rostros en cámara.
+  * Teclas '1'-'9'  : Selecciona directamente el rostro #1, #2, etc. como PILOTO.
+  * Tecla 'g'       : Modo Lentes de Sol: AUTO (detección TDI) -> ON -> OFF.
+  * Tecla 'm'       : Activa / Desactiva el modo espejo horizontal de la cámara.
   * Tecla 'c'       : Inicia o repite la Calibración Personalizada de 3 segundos.
   * Tecla 'e'       : Activa / Desactiva el preprocesamiento Gamma + CLAHE (luz).
   * Tecla 'f'       : Activa / Desactiva el Filtro Temporal EMA (estabilidad vs. sensibilidad).
