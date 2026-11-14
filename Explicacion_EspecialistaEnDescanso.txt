@@ -51,18 +51,28 @@ A) PREPROCESAMIENTO DE IMAGEN (TDI): preprocess_gray_clahe()
      visualiza en vivo en la ventana secundaria ("Result of detector").
 
 
-B) SELECCIÓN DE ÚNICO USUARIO PRINCIPAL (FILTRADO DE ROSTRO)
+B) DETECCIÓN MULTI-ROSTRO Y SELECCIÓN INTERACTIVA DE PILOTO:
+   detect_and_track_pilot(), load_pilot_anchor() y save_pilot_anchor()
    -----------------------------------------------------------------------------
    * ¿Qué hace?
-     Cuando el detector HOG de dlib (detector(gray, 0)) encuentra más de un
-     rostro en el cuadro, el sistema selecciona únicamente el recuadro de mayor
-     área ((x2 - x1) * (y2 - y1)).
+     1. Detecta todos los rostros presentes en el cuadro con el detector HOG de
+        dlib y los ordena de izquierda a derecha (#1, #2, ...), dibujando a los
+        acompañantes en recuadros grises secundarios.
+     2. Permite elegir interactivamente cuál de las personas es el PILOTO
+        mediante click izquierdo sobre su recuadro, con las teclas 'p' / Tab o
+        con las teclas numéricas '1' a '9'.
+     3. Guarda en disco ("piloto_seleccionado.json") la posición normalizada
+        (nx, ny) del asiento del piloto para recordar su ubicación entre sesiones
+        o cuando cambia el conductor en ese mismo asiento.
+     4. Mantiene seguimiento por continuidad espacial (radio máximo respecto al
+        centroide previo) para no saltar por error al rostro de un acompañante
+        si el piloto gira la cabeza o sale momentáneamente de cuadro.
 
    * ¿Cuál es su utilidad?
-     Garantiza que el sistema monitoree exclusivamente al conductor/operador que
-     está en primer plano frente a la cámara, ignorando pasajeros traseros o
-     personas que pasen caminando por detrás para que no alteren las métricas ni
-     los contadores.
+     Garantiza que en un vehículo con acompañantes o pasajeros traseros el
+     sistema evalúe únicamente al conductor designado como PILOTO, permitiendo
+     cambiar de piloto en un clic sin que los movimientos o bostezos de los
+     acompañantes disparen falsas alarmas.
 
 
 C) APERTURA OCULAR: eye_aspect_ratio() (MÉTRICA EAR)
@@ -91,9 +101,11 @@ D) DETECCIÓN DE BOSTEZOS: mouth_aspect_ratio() (MÉTRICA MAR)
    * ¿Cuál es su utilidad?
      Permite detectar bostezos (síntoma temprano clave de somnolencia) de forma
      puramente geométrica y liviana, sin necesitar redes neuronales pesadas (.h5).
-     Al exigir que MAR > 0.50 se mantenga durante 15 frames consecutivos
-     (yawn_consec_frames), distingue perfectamente entre hablar normal y bostezar,
-     incrementando el contador de "Bostezos" y disparando una alerta.
+     Al exigir que MAR > 0.50 se mantenga durante un tiempo real continuo de
+     0.60 segundos (yawn_thresh_sec, medido con reloj monotónico time.monotonic()
+     independientemente de los FPS de la computadora), distingue perfectamente
+     entre hablar normal y bostezar, incrementando el contador de "Bostezos" y
+     disparando una alerta.
 
 
 E) POSTURA CEFÁLICA EN 3 EJES, COMPENSACIÓN POR OJO Y PERSISTENCIA LATERAL:
@@ -120,14 +132,15 @@ E) POSTURA CEFÁLICA EN 3 EJES, COMPENSACIÓN POR OJO Y PERSISTENCIA LATERAL:
         cámara apunta en diagonal. Luego, si la cabeza está de costado respecto
         a la cámara (|Yaw| > 0.18), asigna 85% de peso al ojo expuesto a la
         cámara (verde brillante) y 15% al ojo en escorzo (gris).
-     5. Seguimiento espacial y persistencia lateral (track_subject_face):
-        - Prioriza al sujeto principal combinando área en primer plano y cercanía
-          al centroide previo del conductor.
+     5. Seguimiento espacial y persistencia lateral en segundos reales:
+        - Prioriza al piloto seleccionado combinando continuidad espacial con su
+          centroide previo y su zona anclada (pilot_anchor_norm).
         - Si el detector frontal HOG de dlib pierde momentáneamente la cara por
           un giro brusco o cabeceo de perfil, intenta recuperar el rostro con
           búsqueda local y upsampling en la ROI previa (detector(roi, 1)) y, si
           aún no lo detecta, mantiene el rectángulo de referencia durante hasta
-          25 frames (~1 seg) siguiendo el centroide de los 68 landmarks.
+          1.0 segundo real (medido con frame_dt) siguiendo el centroide de los
+          68 landmarks.
 
    * ¿Cuál es su utilidad?
      Resuelve el escenario real donde la cámara no está frente al volante o el
@@ -141,13 +154,15 @@ E) POSTURA CEFÁLICA EN 3 EJES, COMPENSACIÓN POR OJO Y PERSISTENCIA LATERAL:
        lateral) y detecta el cierre ocular y postural sin perder el rastreo.
 
 
-F) FILTRO PASA-BAJOS TEMPORAL (EMA): ema_filter()
+F) FILTRO PASA-BAJOS TEMPORAL (EMA) INDEPENDIENTE DE FPS: ema_filter()
    -----------------------------------------------------------------------------
    * ¿Qué hace?
-     Aplica una Media Móvil Exponencial:
-         x_suave(t) = alpha * x(t) + (1 - alpha) * x_suave(t - 1)
+     Aplica una Media Móvil Exponencial compensada por el intervalo real entre
+     fotogramas (dt = frame_dt en segundos, tomando como referencia ref_dt = 0.04s):
+         alpha_eff = 1 - (1 - alpha)^(dt / 0.04)
+         x_suave(t) = alpha_eff * x(t) + (1 - alpha_eff) * x_suave(t - 1)
      - Para el contador de parpadeos rápidos usa SIEMPRE el EAR instantáneo sin
-       filtrar (ear_raw), ya que un parpadeo dura apenas 2 a 3 frames.
+       filtrar (ear_raw), ya que un parpadeo dura apenas >= 0.05 segundos.
      - Para el estado de fatiga/sueño usa un suavizado ligero (alpha = 0.60).
      - Para boca (MAR) y cabeza (Pitch, Roll, Yaw) usa un suavizado firme
        (alpha = 0.35).
@@ -155,65 +170,92 @@ F) FILTRO PASA-BAJOS TEMPORAL (EMA): ema_filter()
 
    * ¿Cuál es su utilidad?
      Elimina el temblor (jitter) de 1 o 2 píxeles propio de los landmarks de
-     dlib, evitando que un único frame ruidoso reinicie a 0 los contadores de
-     sueño o cabeceo. Al poder apagarse con la tecla 'f', permite elegir en vivo
-     entre máxima estabilidad (EMA ON) o cero latencia (EMA OFF).
+     dlib, manteniendo exactamente la misma constante de tiempo física tanto en
+     una PC rápida (30 FPS) como en una lenta (10 FPS). Al poder apagarse con la
+     tecla 'f', permite elegir en vivo entre máxima estabilidad (EMA ON) o cero
+     latencia (EMA OFF).
 
 
-G) CALIBRACIÓN INDEPENDIENTE POR OJO + CERO POSTURAL 3D (3 SEGUNDOS) Y PARPADEOS
+G) CALIBRACIÓN BIOMÉTRICA EN 3 SEGUNDOS EFECTIVOS, SUSPENSIÓN DE ALERTAS Y
+   AUTO-CALIBRACIÓN DIFERIDA DE OJOS
    -----------------------------------------------------------------------------
    * ¿Qué hace?
-     - Durante los primeros 3 segundos en los que detecta al usuario (o al tocar
-       la tecla 'c'), mide por separado la mediana de apertura de cada ojo
-       (EAR_L0 y EAR_R0) y el cero postural en los 3 ejes (Pitch_0, Roll_0, Yaw_0),
-       incluso si el conductor mira en diagonal a la cámara.
+     - Durante los primeros 3 segundos efectivos con rostro de piloto en cuadro
+       (o al tocar la tecla 'c'), mide por separado la mediana de apertura de
+       cada ojo (EAR_L0 y EAR_R0) y el cero postural en los 3 ejes (Pitch_0,
+       Roll_0, Yaw_0), incluso si el conductor mira en diagonal a la cámara.
+     - Mientras dura la calibración (is_calibrating = True), suspende todas las
+       evaluaciones y alertas sonoras (tanto oculares como de bostezo y cabeceo)
+       y mantiene en cero todos los acumuladores temporales.
+     - Si el piloto calibró con lentes de sol puestos (por lo que solo se calibró
+       la postura 3D) y más adelante en el viaje se quita los lentes, el sistema
+       recolecta automáticamente 2.0 segundos de muestras de ojos abiertos en
+       segundo plano para fijar su EAR base sin necesidad de recalibrar a mano.
      - Fija automáticamente los umbrales analíticos personalizados sobre el EAR
        medio normalizado:
          * Umbral Activo (ear_active_thresh) = 82% de EAR_base
          * Umbral Ojo Cerrado (ear_sleep_thresh) = 70% de EAR_base
-         * Umbral de Cabeceo (pitch_nod_thresh) = 125% de Pitch_0
-         * Umbral de Inclinación Lateral = |Roll - Roll_0| > 16°
-     - Además, cada vez que el ojo se cierra por >= 2 frames y vuelve a abrirse,
-       incrementa el contador de "Parpadeos".
+         * Umbral de Cabeceo (pitch_nod_thresh) = 125% de Pitch_0 (durante >= 0.55s)
+         * Umbral de Inclinación Lateral = |Roll - Roll_0| > 16° (durante >= 0.55s)
+     - Todos los estados se confirman por duración real con time.monotonic():
+         * Microsueño / Cierre ocular continuo: >= 0.75 s (sleep_thresh_sec)
+         * Fatiga ocular / Entrecerrado: >= 0.40 s (drowsy_thresh_sec)
+         * Recuperación a estado Activo: >= 0.25 s (active_thresh_sec)
+         * Parpadeo válido: cierre >= 0.05 s (blink_min_sec) seguido de apertura.
 
    * ¿Cuál es su utilidad?
-     No todas las personas tienen el mismo tamaño de ojos ni colocan la cámara a
-     la misma altura. La calibración adapta los umbrales analíticos a la
-     fisonomía del usuario en 3 segundos.
+     No todas las personas tienen el mismo tamaño de ojos ni todas las PCs corren
+     a los mismos FPS. Medir tiempos reales con reloj monotónico y calibrar en
+     3 segundos efectivos garantiza que la sensibilidad sea idéntica en cualquier
+     computadora y fisonomía.
 
 
-H) MÉTRICA TEMPORAL ESTÁNDAR PERCLOS: update_perclos() Y ESTADOS DE ALERTA
+H) MÉTRICA TEMPORAL ESTÁNDAR PERCLOS PONDERADA POR DURACIÓN: update_perclos()
    -----------------------------------------------------------------------------
    * ¿Qué hace?
-     Mantiene una ventana temporal móvil de los últimos 30 segundos (configurable
-     con --perclos-window) mediante una cola (collections.deque) con marcas de
-     tiempo reales (timestamps). Calcula el porcentaje de frames dentro de esa
-     ventana en los que el ojo estuvo cerrado (EAR <= ear_sleep_thresh):
-         PERCLOS (%) = (Frames cerrados en ventana / Total frames en ventana) * 100
+     Mantiene una ventana temporal deslizante de los últimos 30 segundos
+     (configurable con --perclos-window) mediante una cola (collections.deque)
+     con marcas de tiempo monotónicas. En lugar de contar muestras (lo cual
+     sesgaría el porcentaje si varían los FPS), pondera cada muestra por su
+     duración real dt = min(t_i - t_{i-1}, 0.5s):
+         PERCLOS (%) = (Tiempo cerrado acumulado / Tiempo total observado) * 100
+     Además, exige un tiempo mínimo de observación efectiva de 5.0 segundos
+     (min_obs_sec = 5.0) tras la calibración antes de reportar valores no nulos,
+     evitando que un único parpadeo recién terminada la calibración dispare el
+     PERCLOS al 100%.
 
    * ¿Cuál es su utilidad?
-     Cumple con el estándar exigido en la consigna:
-     - El contador de frames consecutivos detecta un MICROSUEÑO (cerrar los ojos
-       de corrido por ~1 segundo).
-     - PERCLOS detecta la FATIGA ACUMULADA (cuando la persona todavía no se
-       duerme de corrido, pero parpadea lento, pesado y muy seguido):
-         * PERCLOS < 15% y ojos abiertos  -> Estado: "Activo :)" (Verde)
-         * 15% <= PERCLOS < 25% o entrecerrado -> Estado: "Somnoliento (Fatiga) !" (Naranja)
-         * PERCLOS >= 25% o cierre continuo    -> Estado: "DURMIENDO / SOMNOLENCIA!" (Rojo + Alarma)
+     Cumple rigurosamente con el estándar exigido en la consigna:
+     - El acumulador continuo (0.75 s) detecta un MICROSUEÑO (cerrar los ojos de
+       corrido).
+     - PERCLOS detecta la FATIGA ACUMULADA en la ventana de 30 s:
+         * PERCLOS < 15% y ojos abiertos        -> Estado: "Activo :)" (Verde)
+         * 15% <= PERCLOS < 25% o entrecerrado  -> Estado: "Somnoliento (Fatiga) !" (Naranja)
+         * PERCLOS >= 25% o cierre continuo     -> Estado: "DURMIENDO / SOMNOLENCIA!" (Rojo + Alarma)
 
 
-I) ALARMA SONORA MULTIHILO: sound_alarm() y ensure_alarm_wav()
+I) ALARMA SONORA PERIÓDICA CON CORTE INMEDIATO AL DESPERTAR:
+   sound_alarm(), stop_alarm() y ensure_alarm_wav()
    -----------------------------------------------------------------------------
    * ¿Qué hace?
-     Reproduce el archivo "alarma.wav" en un hilo secundario (daemon thread)
-     protegido por un candado (ALARM_LOCK) usando reproductores nativos de Linux
-     (pw-play / aplay) o playsound. Si el archivo "alarma.wav" no existiera en
-     otra PC, lo sintetiza automáticamente en formato WAV de 16 bits.
+     1. Reproduce el archivo "alarma.wav" en un subproceso no bloqueante
+        (subprocess.Popen con pw-play / aplay en Linux, afplay en macOS o
+        winsound en Windows) gestionado desde un hilo secundario. Si el archivo
+        "alarma.wav" no existiera, lo sintetiza automáticamente en WAV PCM 16-bit.
+     2. Mientras persista la condición de sueño, cabeceo o bostezo, repite la
+        alerta periódicamente cada --alarm-interval segundos (por defecto 2.0 s)
+        para asegurar que el conductor se despierte.
+     3. Apenas el conductor abre los ojos / recupera la postura (o si sale de
+        cuadro), invoca stop_alarm() para terminar de inmediato el subproceso de
+        audio en curso sin esperar a que finalice la pista. Además, si el PERCLOS
+        histórico sigue alto (>= 25%) pero el conductor ya tiene los ojos bien
+        abiertos (eye_state == 2), muestra la advertencia visual de fatiga
+        acumulada pero silencia la alarma acústica.
 
    * ¿Cuál es su utilidad?
-     Emite la alerta acústica inmediata ante microsueño, PERCLOS crítico, bostezo
-     o cabeceo sin congelar los FPS del procesamiento de video ni superponer
-     múltiples audios a la vez.
+     Resuelve dos problemas críticos de usabilidad: evita que una alarma suene
+     una sola vez y quede muda si el conductor sigue dormido, y garantiza que el
+     sonido se corte en el acto apenas el conductor se despierta.
 
 
 J) DETECCIÓN RADIOMÉTRICA DE LENTES DE SOL (TDI): detect_sunglasses_tdi()
@@ -229,10 +271,10 @@ J) DETECCIÓN RADIOMÉTRICA DE LENTES DE SOL (TDI): detect_sunglasses_tdi()
      - Con LENTES DE SOL, el cristal oscuro cubre toda la caja orbital y el ratio
        Órbita/Pómulo cae por debajo de 0.58 (con más de 26 niveles de gris de
        diferencia).
-     - Al confirmarse durante 10 frames (~0.35s) o activarse con la tecla 'g',
-       el sistema pausa la medición de ojos (EAR y PERCLOS) y evalúa la
-       somnolencia exclusivamente mediante la Postura 3D del rostro (Pitch /
-       dRoll) y el Bostezo (MAR).
+     - Al confirmarse durante 0.40 segundos reales (sunglasses_hysteresis_sec) o
+       activarse manualmente con la tecla 'g', el sistema pausa la medición de
+       ojos (EAR y PERCLOS) y evalúa la somnolencia exclusivamente mediante la
+       Postura 3D del rostro (Pitch / dRoll) y el Bostezo (MAR).
 
 
 3. RESUMEN DE CONTROLES INTERACTIVOS EN TIEMPO REAL

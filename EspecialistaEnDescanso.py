@@ -334,6 +334,7 @@ def detect_and_track_pilot(
     persistence_counter,
     pilot_anchor_norm=None,
     max_persistence=25,
+    frame_dt=None,
 ):
     """
     Detecta múltiples rostros en cámara, mantiene el seguimiento del PILOTO seleccionado
@@ -345,7 +346,7 @@ def detect_and_track_pilot(
          cuando el piloto gira la cabeza de costado o sale momentáneamente).
       3. Si el detector frontal pierde el rostro del piloto por giro lateral extremo,
          activa búsqueda local con upsampling=1 y persistencia por hasta max_persistence
-         frames sin perder la vista de los demás rostros en escena.
+         (en segundos reales si se pasa frame_dt, o en frames) sin perder los demás rostros.
       4. Si el asiento del piloto quedó libre y entra un nuevo piloto (o el mismo regresa)
          en la zona recordada (pilot_anchor_norm), lo engancha automáticamente como PILOTO.
     Retorna:
@@ -355,6 +356,7 @@ def detect_and_track_pilot(
     raw_faces = list(detector(gray, 0))
     # Ordenar rostros de izquierda a derecha para numeración estable (#1, #2, ...)
     all_faces = sorted(raw_faces, key=lambda r: 0.5 * (r.left() + r.right()))
+    step_inc = float(frame_dt) if frame_dt is not None else 1
 
     def _center(r):
         return 0.5 * (r.left() + r.right()), 0.5 * (r.top() + r.bottom())
@@ -409,10 +411,10 @@ def detect_and_track_pilot(
                         rx1 + best_sub.right(),
                         ry1 + best_sub.bottom(),
                     )
-                    return [recovered_rect], persistence_counter + 1, True, all_faces, None, pilot_anchor_norm
+                    return [recovered_rect], persistence_counter + step_inc, True, all_faces, None, pilot_anchor_norm
 
             persisted_rect = dlib.rectangle(int(lx1), int(ly1), int(lx2), int(ly2))
-            return [persisted_rect], persistence_counter + 1, True, all_faces, None, pilot_anchor_norm
+            return [persisted_rect], persistence_counter + step_inc, True, all_faces, None, pilot_anchor_norm
 
     # 2. Si no había seguimiento activo (inicio o cambio de piloto tras dejar el asiento libre)
     if len(all_faces) > 0:
@@ -452,15 +454,21 @@ def detect_and_track_pilot(
     return [], persistence_counter, False, all_faces, None, pilot_anchor_norm
 
 
-def ema_filter(current_val, prev_val, alpha):
+def ema_filter(current_val, prev_val, alpha, dt=None, ref_dt=0.04):
     """
-    Filtro pasa-bajos temporal de Media Móvil Exponencial (EMA):
-      x_suave(t) = alpha * x(t) + (1 - alpha) * x_suave(t - 1)
-    Elimina el temblor (jitter) de alta frecuencia de los landmarks de dlib.
+    Filtro pasa-bajos temporal de Media Móvil Exponencial (EMA) independiente de los FPS:
+      x_suave(t) = alpha_eff * x(t) + (1 - alpha_eff) * x_suave(t - 1)
+    Si se pasa dt (frame_dt en segundos), ajusta alpha_eff = 1 - (1 - alpha)^(dt / ref_dt)
+    para mantener exactamente la misma respuesta temporal sin importar los FPS de la PC.
     """
     if prev_val is None:
         return float(current_val)
-    return float(alpha * current_val + (1.0 - alpha) * prev_val)
+    if dt is not None and dt > 0.0 and 0.0 < alpha < 1.0:
+        alpha_eff = 1.0 - ((1.0 - alpha) ** (dt / ref_dt))
+        alpha_eff = float(np.clip(alpha_eff, 0.05, 0.98))
+    else:
+        alpha_eff = float(alpha)
+    return float(alpha_eff * current_val + (1.0 - alpha_eff) * prev_val)
 
 
 def classify_eye_state(ear, ear_active_thresh=0.25, ear_sleep_thresh=0.21):
@@ -771,10 +779,11 @@ def main():
     total_nods = 0
     nod_counted = False
 
-    # Estado de calibración automática inicial (3 segundos mirando en su postura normal/diagonal, o tecla 'c')
+    # Estado de calibración automática inicial (3 segundos efectivos con rostro detectado, o tecla 'c')
     calibration_duration = 3.0
     is_calibrating = True
-    calib_start_ts = None
+    calib_elapsed_sec = 0.0
+    eye_calib_elapsed_sec = 0.0  # Para auto-calibrar los ojos si inició la calibración con lentes de sol
     calib_left_ears = []
     calib_right_ears = []
     calib_pitches = []
@@ -788,10 +797,10 @@ def main():
     roll_base = 0.0
     yaw_base = 0.0
 
-    # Estado de seguimiento espacial, selección de piloto multi-rostro y persistencia lateral
+    # Estado de seguimiento espacial, selección de piloto multi-rostro y persistencia lateral en segundos
     last_face_box = None
-    persistence_counter = 0
-    max_persistence_frames = 25
+    persistence_sec = 0.0
+    max_persistence_sec = 1.0
     pilot_anchor_norm = load_pilot_anchor()
     all_detected_faces = []
     current_pilot_idx = None
@@ -855,14 +864,14 @@ def main():
     prev_frame_ts = fps_time
 
     def _select_face_as_pilot(rect, idx_label, frame_w=640, frame_h=480):
-        nonlocal last_face_box, persistence_counter, pilot_anchor_norm
+        nonlocal last_face_box, persistence_sec, pilot_anchor_norm
         rx1, ry1, rx2, ry2 = rect.left(), rect.top(), rect.right(), rect.bottom()
         last_face_box = (rx1, ry1, rx2, ry2)
-        persistence_counter = 0
+        persistence_sec = 0.0
         cx = 0.5 * (rx1 + rx2)
         cy = 0.5 * (ry1 + ry2)
         pilot_anchor_norm = (
-             float(np.clip(cx / frame_w, 0.0, 1.0)),
+            float(np.clip(cx / frame_w, 0.0, 1.0)),
             float(np.clip(cy / frame_h, 0.0, 1.0)),
         )
         save_pilot_anchor(pilot_anchor_norm)
@@ -894,10 +903,10 @@ def main():
         # Usar la imagen preprocesada en la ventana del detector para visualizar el efecto de Gamma + CLAHE
         face_frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
-        # Detección multi-rostro + seguimiento del PILOTO con memoria de selección y persistencia lateral
+        # Detección multi-rostro + seguimiento del PILOTO con memoria de selección y persistencia lateral (en segundos)
         (
             faces,
-            persistence_counter,
+            persistence_sec,
             is_persisted,
             all_detected_faces,
             current_pilot_idx,
@@ -906,9 +915,10 @@ def main():
             gray,
             detector,
             last_face_box,
-            persistence_counter,
+            persistence_sec,
             pilot_anchor_norm=pilot_anchor_norm,
-            max_persistence=max_persistence_frames,
+            max_persistence=max_persistence_sec,
+            frame_dt=frame_dt,
         )
 
         # Procesar selección por Click izquierdo del mouse sobre cualquier rostro en cámara
@@ -939,6 +949,24 @@ def main():
 
         if not faces:
             last_face_box = None
+            stop_alarm()
+            sleep_duration = drowsy_duration = active_duration = 0.0
+            yawn_duration = head_duration = blink_duration = 0.0
+            yawn_counted = nod_counted = False
+            no_face_msg = (
+                f"CALIBRANDO ({int(min(calib_elapsed_sec / calibration_duration, 1.0) * 100)}%) - Esperando Piloto..."
+                if is_calibrating
+                else "SIN PILOTO EN CUADRO"
+            )
+            cv2.putText(
+                frame,
+                no_face_msg,
+                (10, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0, 165, 255),
+                2,
+            )
             # Si hay una zona de piloto recordada y el asiento está temporalmente vacío, mostrar guía
             if pilot_anchor_norm is not None:
                 ax = int(pilot_anchor_norm[0] * 640)
@@ -995,7 +1023,7 @@ def main():
             box_color = (0, 165, 255) if is_persisted else (0, 255, 0)
             pilot_num = (current_pilot_idx + 1) if current_pilot_idx is not None else 1
             pilot_tag = (
-                f"PILOTO #{pilot_num} (Persistencia {persistence_counter}/{max_persistence_frames})"
+                f"PILOTO #{pilot_num} (Persistencia {persistence_sec:.1f}s/{max_persistence_sec:.1f}s)"
                 if is_persisted
                 else f"PILOTO #{pilot_num}"
             )
@@ -1065,12 +1093,12 @@ def main():
                 yaw_thresh=0.18,
             )
 
-            # Actualizar filtro pasa-bajos temporal (EMA) y elegir señales según use_ema (tecla 'f')
-            ema_ear = ema_filter(ear_raw, ema_ear, alpha_ear)
-            ema_mar = ema_filter(mar_raw, ema_mar, alpha_slow)
-            ema_pitch = ema_filter(pitch_raw, ema_pitch, alpha_slow)
-            ema_roll = ema_filter(roll_raw, ema_roll, alpha_slow)
-            ema_yaw = ema_filter(yaw_raw, ema_yaw, alpha_slow)
+            # Actualizar filtro pasa-bajos temporal (EMA) adaptado a frame_dt (independiente de FPS)
+            ema_ear = ema_filter(ear_raw, ema_ear, alpha_ear, dt=frame_dt)
+            ema_mar = ema_filter(mar_raw, ema_mar, alpha_slow, dt=frame_dt)
+            ema_pitch = ema_filter(pitch_raw, ema_pitch, alpha_slow, dt=frame_dt)
+            ema_roll = ema_filter(roll_raw, ema_roll, alpha_slow, dt=frame_dt)
+            ema_yaw = ema_filter(yaw_raw, ema_yaw, alpha_slow, dt=frame_dt)
 
             if use_ema:
                 ear = ema_ear
@@ -1101,19 +1129,18 @@ def main():
                     if sunglasses_timer <= -sunglasses_hysteresis_sec:
                         sunglasses_active = False
 
-            # Fase de calibración personalizada (3 segundos en postura normal/diagonal o al presionar 'c')
+            # Fase de calibración personalizada (3 segundos efectivos con rostro detectado, o tecla 'c')
             if is_calibrating:
-                if calib_start_ts is None:
-                    calib_start_ts = now_ts
-                elapsed_calib = now_ts - calib_start_ts
+                calib_elapsed_sec += frame_dt
                 if not sunglasses_active and left_ear > 0.14 and right_ear > 0.14:
                     calib_left_ears.append(left_ear)
                     calib_right_ears.append(right_ear)
+                    eye_calib_elapsed_sec += frame_dt
                 calib_pitches.append(pitch_raw)
                 calib_rolls.append(roll_raw)
                 calib_yaws.append(yaw_raw)
 
-                progress = min(elapsed_calib / calibration_duration, 1.0)
+                progress = min(calib_elapsed_sec / calibration_duration, 1.0)
                 status = f"CALIBRANDO... {int(progress * 100)}%"
                 status_color = (255, 255, 0)  # Cian
 
@@ -1136,7 +1163,7 @@ def main():
                     2,
                 )
 
-                if elapsed_calib >= calibration_duration and len(calib_pitches) >= 5:
+                if calib_elapsed_sec >= calibration_duration and len(calib_pitches) >= 5:
                     if len(calib_left_ears) >= 5:
                         left_ear_base = float(np.median(calib_left_ears))
                         right_ear_base = float(np.median(calib_right_ears))
@@ -1151,11 +1178,30 @@ def main():
                     is_calibrating = False
                     perclos_history.clear()
                     sleep_duration = drowsy_duration = active_duration = 0.0
+                    yawn_duration = head_duration = blink_duration = 0.0
+                    yawn_counted = nod_counted = False
                     print(
                         f"[INFO] Calibración completada -> "
                         f"Cero Postural: Pitch0={pitch_base:.2f}, Roll0={roll_base:+.1f}°, Yaw0={yaw_base:+.2f} | "
                         f"Umb EAR: {ear_active_thresh:.3f}/{ear_sleep_thresh:.3f}"
                     )
+            elif not sunglasses_active and left_ear_base is None:
+                # Auto-calibración ocular diferida en segundo plano si calibró con lentes de sol y luego se los sacó
+                if left_ear > 0.14 and right_ear > 0.14:
+                    calib_left_ears.append(left_ear)
+                    calib_right_ears.append(right_ear)
+                    eye_calib_elapsed_sec += frame_dt
+                    if eye_calib_elapsed_sec >= calibration_duration and len(calib_left_ears) >= 5:
+                        left_ear_base = float(np.median(calib_left_ears))
+                        right_ear_base = float(np.median(calib_right_ears))
+                        ear_base = 0.5 * (left_ear_base + right_ear_base)
+                        ear_active_thresh = round(ear_base * 0.82, 3)
+                        ear_sleep_thresh = round(ear_base * 0.70, 3)
+                        print(
+                            f"[INFO] Auto-calibración ocular diferida completada (sin lentes) -> "
+                            f"EAR_L0={left_ear_base:.3f}, EAR_R0={right_ear_base:.3f} | "
+                            f"Umb EAR: {ear_active_thresh:.3f}/{ear_sleep_thresh:.3f}"
+                        )
 
             # Desviaciones posturales respecto al "cero relativo" calibrado (soporta cámara en diagonal)
             delta_roll = roll_deg - roll_base
@@ -1245,9 +1291,9 @@ def main():
                             status = "Activo :)"
                             status_color = (0, 255, 0)  # Verde en BGR
 
-            # Evaluación temporal de bostezo mediante MAR en segundos reales
+            # Evaluación temporal de bostezo mediante MAR en segundos reales (suspendida durante calibración)
             mouth_color = (255, 0, 0)  # Azul por defecto
-            if mar > mar_yawn_thresh:
+            if not is_calibrating and mar > mar_yawn_thresh:
                 yawn_duration += frame_dt
                 mouth_color = (0, 165, 255)  # Naranja mientras abre la boca
                 if yawn_duration >= yawn_thresh_sec:
@@ -1269,9 +1315,9 @@ def main():
                 yawn_duration = 0.0
                 yawn_counted = False
 
-            # Evaluación temporal de cabeceo (Pitch) e inclinación lateral (Roll) en segundos reales
+            # Evaluación temporal de cabeceo (Pitch) e inclinación lateral (Roll) (suspendida durante calibración)
             axis_color = (255, 255, 0)  # Cian por defecto para el eje facial
-            if head_anomaly:
+            if not is_calibrating and head_anomaly:
                 head_duration += frame_dt
                 axis_color = (0, 165, 255)  # Naranja mientras empieza a inclinar/cabecear
                 if head_duration >= head_thresh_sec:
@@ -1298,14 +1344,14 @@ def main():
                 head_duration = 0.0
                 nod_counted = False
 
-            # Si el conductor ya se despertó (ojos abiertos, sin bostezo ni cabeceo activo),
+            # Si está calibrando o el conductor ya se despertó (ojos abiertos, sin bostezo ni cabeceo activo),
             # cortar de inmediato cualquier sonido de alarma que estuviera reproduciéndose
-            eye_alarm_active = (not sunglasses_active) and (
+            eye_alarm_active = (not is_calibrating) and (not sunglasses_active) and (
                 sleep_duration >= sleep_thresh_sec
                 or (perclos >= perclos_sleep_thresh and eye_state < 2)
             )
-            yawn_alarm_active = yawn_duration >= yawn_thresh_sec
-            head_alarm_active = head_duration >= head_thresh_sec
+            yawn_alarm_active = (not is_calibrating) and (yawn_duration >= yawn_thresh_sec)
+            head_alarm_active = (not is_calibrating) and (head_duration >= head_thresh_sec)
             if not (eye_alarm_active or yawn_alarm_active or head_alarm_active):
                 stop_alarm()
 
@@ -1582,12 +1628,18 @@ def main():
             # Reiniciar calibración personalizada de 3 segundos (ambos ojos + cero postural 3D)
             stop_alarm()
             is_calibrating = True
-            calib_start_ts = None
+            calib_elapsed_sec = 0.0
+            eye_calib_elapsed_sec = 0.0
+            left_ear_base = None
+            right_ear_base = None
             calib_left_ears.clear()
             calib_right_ears.clear()
             calib_pitches.clear()
             calib_rolls.clear()
             calib_yaws.clear()
+            sleep_duration = drowsy_duration = active_duration = 0.0
+            yawn_duration = head_duration = blink_duration = 0.0
+            yawn_counted = nod_counted = False
             print("[INFO] Recalibrando umbrales y cero postural 3D por 3 segundos...")
 
     stop_alarm()
