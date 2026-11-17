@@ -1,10 +1,14 @@
 import argparse
+import base64
 import bz2
 from collections import deque
+import concurrent.futures
+import http.client
 import json
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -39,19 +43,19 @@ CURRENT_ALARM_PROC = [None]
 # ==============================================================================
 CONFIG_DETECTOR = {
     # --- 1. Ventana y umbrales de PERCLOS (%) y pesos de cada síntoma ---
-    "perclos_ventana_seg": 30.0,            # Ventana deslizante en segundos para calcular PERCLOS
+    "perclos_ventana_seg": 20.0,            # Ventana deslizante en segundos para calcular PERCLOS
     "perclos_min_obs_seg": 5.0,             # Observación mínima tras calibrar antes de evaluar PERCLOS
-    "perclos_umbral_somnoliento_pct": 15.0, # >= 15% activa el MODO SOMNOLIENTO (Naranja, sin alarma sonora)
-    "perclos_umbral_peligro_pct": 25.0,     # >= 25% dispara PELIGRO + ALARMA (si cierra ojos o cabecea)
+    "perclos_umbral_somnoliento_pct": 35.0, # >= 15% activa el MODO SOMNOLIENTO (Naranja, sin alarma sonora)
+    "perclos_umbral_peligro_pct": 75.0,     # >= 25% dispara PELIGRO + ALARMA (si cierra ojos o cabecea)
     "perclos_peso_ojo_cerrado": 1.00,       # Peso (100%) que aporta tener los ojos cerrados a PERCLOS
     "perclos_peso_ojo_entrecerrado": 0.25,  # Peso (25%) que aporta entrecerrar los ojos a PERCLOS
-    "perclos_peso_cabeceo": 0.70,           # Peso (70%) que aporta la cabeza caída/inclinada a PERCLOS
-    "perclos_bono_por_bostezo_pct": 10.0,   # % extra que suma cada bostezo confirmado al PERCLOS actual
+    "perclos_peso_cabeceo": 0.55,           # Peso (70%) que aporta la cabeza caída/inclinada a PERCLOS
+    "perclos_bono_por_bostezo_pct": 15.0,   # % extra que suma cada bostezo confirmado al PERCLOS actual
     "perclos_tope_bostezos_pct": 20.0,      # Tope máximo de % por bostezos (nunca llega a 25% por sí solo)
 
     # --- 2. ESTADO 1: MODO ACTIVO (Conductor fresco -> Baja sensibilidad, tolerante) ---
     "activo_ojos_peligro_seg": 1.15,        # Segundos de ojos cerrados para sonar alarma estando fresco
-    "activo_ojos_entrecerrados_seg": 0.65,  # Segundos de ojos entrecerrados para pasar a Modo Somnoliento
+    "activo_ojos_entrecerrados_seg": 0.70,  # Segundos de ojos entrecerrados para pasar a Modo Somnoliento
     "activo_cabeceo_peligro_seg": 1.75,     # Segundos de caída de cabeza para sonar alarma estando fresco
     "activo_cabeceo_sintoma_seg": 0.85,     # Segundos de cabeceo corto que activa Modo Somnoliento (sin alarma)
     "activo_pitch_factor": 1.45,            # Caída vertical requerida en Modo Activo (145% de Pitch_0)
@@ -73,6 +77,14 @@ CONFIG_DETECTOR = {
     "bostezo_duracion_seg": 1.35,           # Segundos con boca abierta para confirmar bostezo (NO dispara alarma)
     "parpadeo_min_seg": 0.05,               # Duración mínima de cierre para contar 1 parpadeo
     "recuperacion_activo_seg": 0.25,        # Segundos con ojos abiertos para recuperar estado / cortar alarma
+
+    # --- 5. Cámara IP de Visión Nocturna (Foscam FI9820W por Ethernet) ---
+    "usar_ipcam_por_defecto": True,         # Si es True, intenta iniciar con la FI9820W (tecla 'v' alterna con Webcam)
+    "ipcam_ip": "10.42.0.203",              # Dirección IP de la cámara Foscam FI9820W
+    "ipcam_port": 80,                       # Puerto HTTP/CGI de la cámara FI9820W
+    "ipcam_user": "admin",                  # Usuario de la cámara FI9820W
+    "ipcam_password": "admin",              # Contraseña de la cámara FI9820W
+    "ipcam_invertir_ptz_espejo": True,      # Invierte flechas Izq/Der cuando el modo espejo está activo
 }
 # ==============================================================================
 
@@ -724,11 +736,180 @@ def sound_alarm(path):
         ALARM_LOCK.release()
 
 
-def open_camera(preferred_index=0):
+class FoscamIPCapture:
     """
-    Intenta abrir el índice de cámara indicado; si falla en otra computadora
-    (por cámaras virtuales o diferente orden de dispositivos), prueba índices 0, 1 y 2.
+    Cliente de captura sin lag (0 ms de buffer) y control CGI (Visión Nocturna IR + Motor PTZ)
+    para la cámara IP Foscam FI9820W (chipset HiSilicon Hi3510) conectada por Ethernet:
+      - Serializa TODAS las peticiones HTTP (snapshots '/tmpfs/snap.jpg', comandos IR y PTZ)
+        en un único hilo con HTTP Keep-Alive y ritmo controlado (~10-12 FPS) más cooldown PTZ,
+        evitando saturar o colgar el servidor embebido 'thttpd' de la cámara.
     """
+
+    def __init__(self, ip, port=80, user="admin", password="admin", timeout=2.0):
+        self.ip = str(ip)
+        self.port = int(port)
+        self.timeout = float(timeout)
+        token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+        self.headers = {
+            "Authorization": f"Basic {token}",
+            "Connection": "keep-alive",
+        }
+        self.is_ipcam = True
+        self.ir_mode = "AUTO"  # "AUTO", "ON", "OFF"
+        self._frame = None
+        self._lock = threading.Lock()
+        self._cgi_queue = deque()
+        self._last_ptz_ts = 0.0
+        self._running = False
+        self._thread = None
+
+        # Probar conexión inicial y obtener el primer frame
+        first_frame = self._fetch_single_frame()
+        if first_frame is not None:
+            self._frame = first_frame
+            self._running = True
+            self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+            self._thread.start()
+
+    def _fetch_single_frame(self):
+        conn = None
+        try:
+            conn = http.client.HTTPConnection(self.ip, self.port, timeout=self.timeout)
+            conn.request("GET", "/tmpfs/snap.jpg", headers=self.headers)
+            resp = conn.getresponse()
+            data = resp.read()
+            if resp.status == 200 and len(data) > 500:
+                arr = np.frombuffer(data, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                return img
+        except Exception:
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        return None
+
+    def _reader_loop(self):
+        conn = None
+        min_frame_interval = 0.085  # ~11-12 FPS máximos para no saturar thttpd en la FI9820W
+        while self._running:
+            t_start = time.monotonic()
+            try:
+                if conn is None:
+                    conn = http.client.HTTPConnection(self.ip, self.port, timeout=self.timeout)
+
+                # Ejecutar primero cualquier comando CGI pendiente (IR o PTZ) en la misma conexión serializada
+                while self._cgi_queue:
+                    cgi_path = self._cgi_queue.popleft()
+                    conn.request("GET", cgi_path, headers=self.headers)
+                    c_resp = conn.getresponse()
+                    c_resp.read()
+
+                conn.request("GET", "/tmpfs/snap.jpg", headers=self.headers)
+                resp = conn.getresponse()
+                data = resp.read()
+                if resp.status == 200 and len(data) > 500:
+                    arr = np.frombuffer(data, dtype=np.uint8)
+                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if img is not None:
+                        with self._lock:
+                            self._frame = img
+                else:
+                    conn.close()
+                    conn = None
+                    time.sleep(0.10)
+            except Exception:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+                time.sleep(0.15)
+
+            elapsed = time.monotonic() - t_start
+            if elapsed < min_frame_interval:
+                time.sleep(min_frame_interval - elapsed)
+
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def isOpened(self):
+        return self._running and (self._frame is not None)
+
+    def read(self):
+        if not self._running:
+            return False, None
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            return True, self._frame.copy()
+
+    def release(self):
+        self._running = False
+
+    def cycle_infrared_mode(self):
+        """Alterna los LEDs de Visión Nocturna IR de la FI9820W: AUTO -> ON (open) -> OFF (close)."""
+        modes = ["AUTO", "ON", "OFF"]
+        self.ir_mode = modes[(modes.index(self.ir_mode) + 1) % len(modes)]
+        cgi_map = {"AUTO": "auto", "ON": "open", "OFF": "close"}
+        stat = cgi_map[self.ir_mode]
+        self._cgi_queue.append(f"/cgi-bin/hi3510/param.cgi?cmd=setinfrared&-infraredstat={stat}")
+        print(f"[INFO] Visión Nocturna IR (FI9820W): {self.ir_mode} (infraredstat={stat})")
+        return self.ir_mode
+
+    def ptz_move(self, direction):
+        """
+        Encola un paso del motor PTZ de la FI9820W ('up', 'down', 'left', 'right')
+        con un cooldown de 0.45s para no inundar de peticiones al motor ni a thttpd.
+        """
+        now_m = time.monotonic()
+        if (now_m - self._last_ptz_ts) < 0.45 or len(self._cgi_queue) >= 2:
+            return
+        cmd_map = {
+            "up": "/cgi-bin/hi3510/ytup.cgi",
+            "down": "/cgi-bin/hi3510/ytdown.cgi",
+            "left": "/cgi-bin/hi3510/ytleft.cgi",
+            "right": "/cgi-bin/hi3510/ytright.cgi",
+        }
+        path = cmd_map.get(direction)
+        if path:
+            self._last_ptz_ts = now_m
+            self._cgi_queue.append(path)
+
+
+def detect_ir_night_vision(frame_bgr, face_box=None):
+    """
+    Detecta si el fotograma actual está en modo Visión Nocturna Infrarroja (IR / monocromático):
+    cuando los LEDs IR de 850nm están encendidos y el filtro IR-cut se activa, los tres canales
+    B, G y R tienen prácticamente la misma intensidad (|R - B| < 5.0 y |R - G| < 5.0).
+    """
+    h, w = frame_bgr.shape[:2]
+    if face_box is not None:
+        fx1, fy1, fx2, fy2 = face_box
+        fx1, fy1 = max(0, fx1), max(0, fy1)
+        fx2, fy2 = min(w, fx2), min(h, fy2)
+        roi = frame_bgr[fy1:fy2, fx1:fx2]
+    else:
+        roi = frame_bgr[int(h * 0.20):int(h * 0.80), int(w * 0.20):int(w * 0.80)]
+
+    if roi.size < 300:
+        roi = frame_bgr
+
+    b, g, r = cv2.split(roi.astype(np.float32))
+    diff_rb = float(np.mean(np.abs(r - b)))
+    diff_rg = float(np.mean(np.abs(r - g)))
+    return (diff_rb < 5.0) and (diff_rg < 5.0)
+
+
+def open_webcam_local(preferred_index=0):
+    """Abre una cámara web USB/integrada local probando índices 0, 1 y 2."""
     candidates = [preferred_index] + [i for i in (0, 1, 2) if i != preferred_index]
     for idx in candidates:
         if platform.system() == "Windows":
@@ -745,9 +926,111 @@ def open_camera(preferred_index=0):
                     print(f"[INFO] Cámara {preferred_index} no disponible; usando cámara {idx}.")
                 return cap
             cap.release()
+    return None
+
+
+def discover_foscam_ip(default_ip="10.42.0.203", port=80):
+    """
+    Verifica primero la IP configurada (por defecto 10.42.0.203) y, si la cámara cambió de IP
+    por DHCP en la interfaz Ethernet compartida (10.42.0.x), la descubre automáticamente.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.35)
+    try:
+        if s.connect_ex((default_ip, port)) == 0:
+            s.close()
+            return default_ip
+    except Exception:
+        pass
+    finally:
+        s.close()
+
+    def _probe(ip_cand):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(0.10)
+        try:
+            if sock.connect_ex((ip_cand, port)) == 0:
+                sock.close()
+                return ip_cand
+        except Exception:
+            pass
+        finally:
+            sock.close()
+        return None
+
+    candidates = [f"10.42.0.{i}" for i in range(2, 255) if f"10.42.0.{i}" != default_ip]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=48) as ex:
+        for res in ex.map(_probe, candidates):
+            if res is not None:
+                return res
+    return default_ip
+
+
+def open_ip_camera(ip=None):
+    """Intenta abrir la cámara IP de visión nocturna Foscam FI9820W (con auto-descubrimiento en 10.42.0.x)."""
+    port = CONFIG_DETECTOR["ipcam_port"]
+    user = CONFIG_DETECTOR["ipcam_user"]
+    password = CONFIG_DETECTOR["ipcam_password"]
+    target_ip = ip if ip else discover_foscam_ip(CONFIG_DETECTOR["ipcam_ip"], port=port)
+    print(f"[INFO] Conectando a cámara IP Visión Nocturna FI9820W en {target_ip}:{port}...")
+    ip_cap = FoscamIPCapture(target_ip, port=port, user=user, password=password)
+    if ip_cap.isOpened():
+        print(
+            f"[INFO] Cámara IP FI9820W ({target_ip}) conectada "
+            f"(Flechas: mover PTZ | 'n': modo IR | 'v': alternar con Webcam)."
+        )
+        return ip_cap
+    return None
+
+
+def open_camera(preferred_source="auto"):
+    """
+    Abre la fuente de video seleccionada:
+      - 'auto': si 'usar_ipcam_por_defecto' es True en CONFIG_DETECTOR, intenta primero la FI9820W
+        y si no está conectada recurre a la webcam local (y viceversa).
+      - 'ip' o dirección IP (ej. '10.42.0.203'): abre la cámara IP FI9820W.
+      - '0', '1', '2': abre el índice de webcam local (con fallback a la cámara IP si falla).
+    """
+    src_str = str(preferred_source).strip().lower()
+    if src_str == "auto":
+        if CONFIG_DETECTOR.get("usar_ipcam_por_defecto", True):
+            cap = open_ip_camera()
+            if cap is not None:
+                return cap
+            print("[WARN] No se detectó la FI9820W en Ethernet; abriendo Webcam local...")
+            cap = open_webcam_local(0)
+            if cap is not None:
+                return cap
+        else:
+            cap = open_webcam_local(0)
+            if cap is not None:
+                return cap
+            cap = open_ip_camera()
+            if cap is not None:
+                return cap
+    elif src_str == "ip" or "." in src_str:
+        ip_addr = None if src_str == "ip" else src_str
+        cap = open_ip_camera(ip_addr)
+        if cap is not None:
+            return cap
+        print("[WARN] Falló la conexión a la cámara IP; intentando Webcam local...")
+        cap = open_webcam_local(0)
+        if cap is not None:
+            return cap
+    else:
+        try:
+            idx = int(src_str)
+        except ValueError:
+            idx = 0
+        cap = open_webcam_local(idx)
+        if cap is not None:
+            return cap
+        cap = open_ip_camera()
+        if cap is not None:
+            return cap
+
     raise RuntimeError(
-        "No se pudo abrir ninguna cámara web (índices probados: 0, 1, 2). "
-        "Verificá que la cámara esté conectada y no esté siendo usada por otro programa."
+        "No se pudo abrir ni la cámara IP FI9820W ni ninguna cámara web local (0, 1, 2)."
     )
 
 
@@ -767,9 +1050,9 @@ def parse_args():
     )
     parser.add_argument(
         "--camera",
-        type=int,
-        default=0,
-        help="Índice de la cámara / dispositivo de captura",
+        type=str,
+        default="auto",
+        help="Fuente de cámara: 'auto' (por defecto), 'ip' / IP de la FI9820W, o índice '0', '1', '2'",
     )
     parser.add_argument(
         "--perclos-window",
@@ -938,11 +1221,37 @@ def main():
 
     print(
         "[INFO] Iniciando captura de video "
-        "(Click/'p'/'1-9': elegir Piloto | 'c': recalibrar | 'e': CLAHE | 'f': EMA | 'm': espejo | 'q': salir)..."
+        "(Click/'p'/'1-9': Piloto | Flechas: PTZ | 'n': IR | 'v': cambiar cámara | 'c': recalibrar | 'q': salir)..."
     )
     cap = open_camera(args.camera)
     fps_time = time.monotonic()
     prev_frame_ts = fps_time
+
+    def _reset_calibration_state(msg="[INFO] Recalibrando umbrales y cero postural 3D por 3 segundos..."):
+        nonlocal is_calibrating, calib_elapsed_sec, eye_calib_elapsed_sec
+        nonlocal left_ear_base, right_ear_base, perclos, drowsy_mode_until, drowsy_mode_active
+        nonlocal sleep_duration, drowsy_duration, active_duration
+        nonlocal yawn_duration, head_duration, blink_duration, yawn_counted, nod_counted
+        stop_alarm()
+        is_calibrating = True
+        calib_elapsed_sec = 0.0
+        eye_calib_elapsed_sec = 0.0
+        left_ear_base = None
+        right_ear_base = None
+        calib_left_ears.clear()
+        calib_right_ears.clear()
+        calib_pitches.clear()
+        calib_rolls.clear()
+        calib_yaws.clear()
+        perclos_history.clear()
+        yawn_timestamps.clear()
+        perclos = 0.0
+        drowsy_mode_until = -1e9
+        drowsy_mode_active = False
+        sleep_duration = drowsy_duration = active_duration = 0.0
+        yawn_duration = head_duration = blink_duration = 0.0
+        yawn_counted = nod_counted = False
+        print(msg)
 
     def _select_face_as_pilot(rect, idx_label, frame_w=640, frame_h=480):
         nonlocal last_face_box, persistence_sec, pilot_anchor_norm
@@ -976,9 +1285,17 @@ def main():
         if mirror_camera:
             frame = cv2.flip(frame, 1)
 
+        # Detectar si la imagen actual está en modo Visión Nocturna Infrarroja (IR monocromático)
+        is_ir_vision = detect_ir_night_vision(frame, face_box=last_face_box)
+        target_lum_val = 118.0 if is_ir_vision else 110.0
+
         # Preprocesamiento TDI midiendo la luz exclusivamente dentro del rostro del piloto
         gray, current_gamma, mean_lum = preprocess_gray_clahe(
-            frame, clahe, use_clahe=use_clahe, face_box=last_face_box
+            frame,
+            clahe,
+            use_clahe=use_clahe,
+            face_box=last_face_box,
+            target_lum=target_lum_val,
         )
 
         # Usar la imagen preprocesada en la ventana del detector para visualizar el efecto de Gamma + CLAHE
@@ -1692,34 +2009,40 @@ def main():
                 1,
             )
 
-        # Indicador de cantidad de rostros detectados, selección de Piloto y estado de Lentes de Sol
+        # Indicador de cantidad de rostros detectados, selección de Piloto, Lentes de Sol y Visión Nocturna IR
         num_faces = len(all_detected_faces)
         sg_tag = f"Lentes:{'SI' if sunglasses_active else 'NO'}({sunglasses_mode}[g])"
+        is_ipcam_active = getattr(cap, "is_ipcam", False)
+        if is_ipcam_active:
+            ir_tag = f"IR:{getattr(cap, 'ir_mode', 'AUTO')}[n]{'(Activo)' if is_ir_vision else ''} | [Flechas]PTZ"
+        else:
+            ir_tag = "Cam:Webcam[v]"
         pilot_str = (
-            f"Rostros:{num_faces} | Piloto:#{current_pilot_idx + 1} [Click/p] | {sg_tag}"
+            f"Rostros:{num_faces} | Piloto:#{current_pilot_idx + 1}[p] | {sg_tag} | {ir_tag}"
             if current_pilot_idx is not None
-            else f"Rostros:{num_faces} | [Click/p] Piloto | {sg_tag}"
+            else f"Rostros:{num_faces} | [Click/p]Piloto | {sg_tag} | {ir_tag}"
         )
         cv2.putText(
             frame,
             pilot_str,
             (10, 435),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (220, 120, 255) if sunglasses_active else ((0, 255, 255) if num_faces > 1 else (200, 200, 200)),
+            0.44,
+            (220, 120, 255) if sunglasses_active else ((0, 255, 255) if is_ir_vision else (200, 200, 200)),
             1,
         )
 
-        # Cálculo y visualización de FPS e indicadores de controles ('c', 'e', 'f', 'p', 'm', 'g')
+        # Cálculo y visualización de FPS e indicadores de controles ('c', 'e', 'f', 'p', 'm', 'g', 'v', 'n')
         now = time.monotonic()
         fps = 1.0 / max(now - fps_time, 1e-6)
         fps_time = now
+        cam_short = "FI9820W[v]" if is_ipcam_active else "Webcam[v]"
         cv2.putText(
             frame,
-            f"FPS: {fps:.1f} | [c]Calib | [m]Espejo",
+            f"FPS:{fps:.1f} | {cam_short} | [c]Calib | [m]Esp",
             (10, 460),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            0.46,
             (0, 255, 0),
             2,
         )
@@ -1729,9 +2052,9 @@ def main():
         cv2.putText(
             frame,
             ema_label,
-            (270, 460),
+            (315, 460),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            0.46,
             ema_color,
             2,
         )
@@ -1741,18 +2064,19 @@ def main():
         cv2.putText(
             frame,
             clahe_label,
-            (395, 460),
+            (415, 460),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            0.46,
             clahe_color,
             2,
         )
+        ir_det_str = " | Modo:IR Nocturno" if is_ir_vision else " | Modo:Visible"
         cv2.putText(
             face_frame,
-            f"{clahe_label} | Luz:{mean_lum:.0f} | Gamma:{current_gamma:.2f}",
+            f"{clahe_label} | Luz:{mean_lum:.0f} | Gamma:{current_gamma:.2f}{ir_det_str}",
             (10, 25),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.52,
+            0.48,
             clahe_color,
             2,
         )
@@ -1761,9 +2085,63 @@ def main():
         cv2.imshow(win_main, frame)
         cv2.imshow(win_det, face_frame)
 
-        key = cv2.waitKey(1) & 0xFF
+        raw_key = cv2.waitKeyEx(1)
+        if raw_key == -1:
+            continue
+
+        # Detectar teclas de FLECHAS (Arriba, Abajo, Izquierda, Derecha) en Linux (X11/GTK/Qt), Windows y macOS
+        k16 = raw_key & 0xFFFF
+        arrow_dir = None
+        if k16 == 0xFF52 or raw_key in (2490368, 63232):
+            arrow_dir = "up"
+        elif k16 == 0xFF54 or raw_key in (2621440, 63233):
+            arrow_dir = "down"
+        elif k16 == 0xFF51 or raw_key in (2424832, 63234):
+            arrow_dir = (
+                "right"
+                if (mirror_camera and CONFIG_DETECTOR.get("ipcam_invertir_ptz_espejo", True))
+                else "left"
+            )
+        elif k16 == 0xFF53 or raw_key in (2555904, 63235):
+            arrow_dir = (
+                "left"
+                if (mirror_camera and CONFIG_DETECTOR.get("ipcam_invertir_ptz_espejo", True))
+                else "right"
+            )
+
+        if arrow_dir is not None:
+            if getattr(cap, "is_ipcam", False) and hasattr(cap, "ptz_move"):
+                cap.ptz_move(arrow_dir)
+            continue
+
+        key = raw_key & 0xFF
         if key == ord("q") or key == 27:  # 'q' o tecla ESC
             break
+        elif key == ord("n"):
+            if getattr(cap, "is_ipcam", False) and hasattr(cap, "cycle_infrared_mode"):
+                cap.cycle_infrared_mode()
+            else:
+                print("[INFO] El control de LEDs IR ('n') solo está disponible con la cámara IP FI9820W.")
+        elif key == ord("v"):
+            # Alternar en vivo entre la cámara IP FI9820W y la Webcam local
+            if getattr(cap, "is_ipcam", False):
+                new_cap = open_webcam_local(0)
+                if new_cap is not None:
+                    cap.release()
+                    cap = new_cap
+                    last_face_box = None
+                    _reset_calibration_state("[INFO] Cambiado a Webcam local -> Recalibrando 3 segundos...")
+                else:
+                    print("[WARN] No se encontró una Webcam local disponible.")
+            else:
+                new_cap = open_ip_camera()
+                if new_cap is not None:
+                    cap.release()
+                    cap = new_cap
+                    last_face_box = None
+                    _reset_calibration_state("[INFO] Cambiado a Cámara IP FI9820W -> Recalibrando 3 segundos...")
+                else:
+                    print("[WARN] No se pudo conectar a la Cámara IP FI9820W.")
         elif key == ord("g"):
             modes = ["AUTO", "ON", "OFF"]
             sunglasses_mode = modes[(modes.index(sunglasses_mode) + 1) % len(modes)]
@@ -1790,27 +2168,7 @@ def main():
             state_str = "ACTIVADO (estabilidad)" if use_ema else "DESACTIVADO (máxima sensibilidad)"
             print(f"[INFO] Filtro EMA {state_str}")
         elif key == ord("c"):
-            # Reiniciar calibración personalizada de 3 segundos (ambos ojos + cero postural 3D)
-            stop_alarm()
-            is_calibrating = True
-            calib_elapsed_sec = 0.0
-            eye_calib_elapsed_sec = 0.0
-            left_ear_base = None
-            right_ear_base = None
-            calib_left_ears.clear()
-            calib_right_ears.clear()
-            calib_pitches.clear()
-            calib_rolls.clear()
-            calib_yaws.clear()
-            perclos_history.clear()
-            yawn_timestamps.clear()
-            perclos = 0.0
-            drowsy_mode_until = -1e9
-            drowsy_mode_active = False
-            sleep_duration = drowsy_duration = active_duration = 0.0
-            yawn_duration = head_duration = blink_duration = 0.0
-            yawn_counted = nod_counted = False
-            print("[INFO] Recalibrando umbrales y cero postural 3D por 3 segundos...")
+            _reset_calibration_state()
 
     stop_alarm()
     cap.release()

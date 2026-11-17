@@ -68,7 +68,10 @@ cd TDI-Sistema-de-Detecci-n-de-Somnolencia-Drowsiness-detection-
 - **Click izquierdo sobre un rostro**: Seleccionar a esa persona como **PILOTO** y recordar su ubicación en el habitáculo.
 - **Tecla `p` o `Tab`**: Alternar la selección de **PILOTO** entre todos los rostros detectados en cámara.
 - **Teclas `1` a `9`**: Seleccionar directamente el rostro `#1`, `#2`, etc. como **PILOTO**.
-- **Tecla `g`**: Cambiar modo de **Lentes de Sol** (`AUTO` por detección radiométrica TDI $\rightarrow$ `ON` forzado $\rightarrow$ `OFF`). Cuando está activo, omite `EAR`/`PERCLOS` y evalúa somnolencia mediante postura 3D (`Pitch`/`dRoll`) y bostezo (`MAR`).
+- **Flechas del teclado (`↑`, `↓`, `←`, `→`)**: Mover el cabezal motorizado (**PTZ**) de la cámara de visión nocturna **Foscam FI9820W** para encuadrar al piloto.
+- **Tecla `n`**: Alternar el modo de **Visión Nocturna Infrarroja (LEDs IR)** de la cámara FI9820W (`AUTO` $\rightarrow$ `ON` forzado $\rightarrow$ `OFF`).
+- **Tecla `v`**: Alternar en vivo entre la **Cámara IP FI9820W** (Ethernet) y la **Webcam local** de la computadora.
+- **Tecla `g`**: Cambiar modo de **Lentes de Sol** (`AUTO` por detección radiométrica TDI $\rightarrow$ `ON` forzado $\rightarrow$ `OFF`). Cuando está activo, omite `EAR` y evalúa somnolencia mediante postura 3D (`Pitch`/`dRoll`), bostezo (`MAR`) y `PERCLOS` postural/bostezos.
 - **Tecla `m`**: Activar / Desactivar el modo espejo horizontal de la cámara.
 - **Tecla `c`**: Volver a calibrar los umbrales (3 segundos efectivos con rostro en cuadro).
 - **Tecla `e`**: Activar / Desactivar la corrección de iluminación en el rostro (**Gamma Adaptativo + CLAHE**).
@@ -79,9 +82,9 @@ cd TDI-Sistema-de-Detecci-n-de-Somnolencia-Drowsiness-detection-
 
 ## Parámetros opcionales por línea de comandos
 ```bash
-python EspecialistaEnDescanso.py --camera 0 --perclos-window 30 --alarm-interval 2.0
+python EspecialistaEnDescanso.py --camera auto --perclos-window 30 --alarm-interval 2.0
 ```
-- `--camera`: Índice de la cámara web a utilizar (por defecto `0`).
+- `--camera`: Fuente de video: `auto` (por defecto: intenta primero la Foscam FI9820W en Ethernet `10.42.0.203` y si no está conectada usa la webcam local `0`), `ip` (o una IP específica), o un índice `0`, `1`, `2`.
 - `--perclos-window`: Ventana deslizante en segundos para el cálculo de `PERCLOS` (por defecto `30.0`).
 - `--alarm-interval`: Intervalo en segundos para repetir la alarma sonora mientras persista el estado de somnolencia (por defecto `2.0`; se detiene inmediatamente al abrir los ojos o recuperar la postura).
 - `--shape`: Ruta personalizada al modelo `shape_predictor_68_face_landmarks.dat`.

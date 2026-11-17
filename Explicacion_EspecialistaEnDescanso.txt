@@ -289,8 +289,36 @@ J) DETECCIÓN RADIOMÉTRICA DE LENTES DE SOL (TDI): detect_sunglasses_tdi()
        Postura 3D del rostro (Pitch / dRoll) y el Bostezo (MAR).
 
 
+K) CÁMARA IP DE VISIÓN NOCTURNA (FOSCAM FI9820W POR ETHERNET) Y CONTROL PTZ / IR:
+   FoscamIPCapture y detect_ir_night_vision()
+   -----------------------------------------------------------------------------
+   * ¿Qué hace?
+     1. Conexión en tiempo real sin lag (FoscamIPCapture):
+        Se conecta por Ethernet a la cámara IP Foscam FI9820W (10.42.0.203:80,
+        chipset HiSilicon Hi3510) mediante un hilo secundario con HTTP Keep-Alive
+        que descarga continuamente '/tmpfs/snap.jpg' desde la RAM de la cámara,
+        eliminando el atraso de buffer típico de RTSP. Si la cámara IP no está
+        conectada, recurre automáticamente a la Webcam local (y permite alternar
+        en vivo entre ambas con la tecla 'v').
+     2. Control de LEDs Infrarrojos (tecla 'n') y Detección de Modo IR:
+        - Envía el comando CGI '/cgi-bin/hi3510/param.cgi?cmd=setinfrared' para
+          alternar los LEDs de visión nocturna entre AUTO, ON (open) y OFF (close).
+        - detect_ir_night_vision() verifica automáticamente si la imagen está en
+          modo infrarrojo monocromático (|R - B| < 5 y |R - G| < 5) para adaptar
+          la luminancia objetivo del bloque Gamma + CLAHE.
+     3. Control del motor PTZ con las Flechas del teclado:
+        Permite girar el cabezal motorizado de la cámara (Arriba, Abajo,
+        Izquierda, Derecha) directamente desde la ventana del programa mediante
+        los endpoints CGI '/cgi-bin/hi3510/ytup.cgi', 'ytdown.cgi', 'ytleft.cgi'
+        y 'ytright.cgi', invirtiendo automáticamente Izquierda/Derecha cuando el
+        modo espejo está activo para que coincida con lo que se ve en pantalla.
+
+
 3. RESUMEN DE CONTROLES INTERACTIVOS EN TIEMPO REAL
 --------------------------------------------------------------------------------
+  * Flechas (↑↓←→)  : Mueve el motor PTZ de la cámara IP Foscam FI9820W.
+  * Tecla 'n'       : Modo Visión Nocturna (LEDs IR FI9820W): AUTO -> ON -> OFF.
+  * Tecla 'v'       : Alterna en vivo entre Cámara IP FI9820W y Webcam local.
   * Click izquierdo : Selecciona el rostro clickeado como PILOTO y guarda su zona.
   * Tecla 'p' o Tab : Alterna la selección de PILOTO entre los rostros en cámara.
   * Teclas '1'-'9'  : Selecciona directamente el rostro #1, #2, etc. como PILOTO.
