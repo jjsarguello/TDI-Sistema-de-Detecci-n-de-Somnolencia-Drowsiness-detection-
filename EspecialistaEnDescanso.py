@@ -757,6 +757,10 @@ class FoscamIPCapture:
         self.is_ipcam = True
         self.ir_mode = "AUTO"  # "AUTO", "ON", "OFF"
         self._frame = None
+        self._frame_ts = 0.0
+        self._frame_id = 0
+        self._read_id = -1
+        self.last_error = None
         self._lock = threading.Lock()
         self._cgi_queue = deque()
         self._last_ptz_ts = 0.0
@@ -767,6 +771,7 @@ class FoscamIPCapture:
         first_frame = self._fetch_single_frame()
         if first_frame is not None:
             self._frame = first_frame
+            self._frame_ts = time.monotonic()
             self._running = True
             self._thread = threading.Thread(target=self._reader_loop, daemon=True)
             self._thread.start()
@@ -781,9 +786,12 @@ class FoscamIPCapture:
             if resp.status == 200 and len(data) > 500:
                 arr = np.frombuffer(data, dtype=np.uint8)
                 img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is None:
+                    self.last_error = "La respuesta no contiene un JPEG válido"
                 return img
-        except Exception:
-            pass
+            self.last_error = f"HTTP {resp.status}: no se recibió una imagen válida"
+        except Exception as exc:
+            self.last_error = str(exc)
         finally:
             if conn is not None:
                 try:
@@ -817,6 +825,8 @@ class FoscamIPCapture:
                     if img is not None:
                         with self._lock:
                             self._frame = img
+                            self._frame_ts = time.monotonic()
+                            self._frame_id += 1
                 else:
                     conn.close()
                     conn = None
@@ -847,9 +857,15 @@ class FoscamIPCapture:
         if not self._running:
             return False, None
         with self._lock:
-            if self._frame is None:
+            if (self._frame is None or self._read_id == self._frame_id
+                    or time.monotonic() - self._frame_ts > self.timeout):
                 return False, None
+            self._read_id = self._frame_id
             return True, self._frame.copy()
+
+    def frame_age(self):
+        with self._lock:
+            return time.monotonic() - self._frame_ts
 
     def release(self):
         self._running = False
@@ -980,7 +996,64 @@ def open_ip_camera(ip=None):
             f"(Flechas: mover PTZ | 'n': modo IR | 'v': alternar con Webcam)."
         )
         return ip_cap
+    print(f"[WARN] FI9820W: {ip_cap.last_error or 'sin imagen'}")
+    ip_cap.release()
     return None
+
+
+class CameraSwitch:
+    """Abre la siguiente cámara sin bloquear las ventanas ni abandonar la actual."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending = False
+        self._done = False
+        self._closed = False
+        self._result = None
+        self._error = None
+
+    @property
+    def pending(self):
+        with self._lock:
+            return self._pending
+
+    def start(self, opener):
+        with self._lock:
+            if self._pending or self._closed:
+                return
+            self._pending = True
+
+        def connect():
+            result, error = None, None
+            try:
+                result = opener()
+            except Exception as exc:
+                error = str(exc)
+            with self._lock:
+                if self._closed:
+                    if result is not None:
+                        result.release()
+                    return
+                self._result, self._error = result, error
+                self._done = True
+
+        threading.Thread(target=connect, daemon=True).start()
+
+    def poll(self):
+        with self._lock:
+            if not self._done:
+                return False, None, None
+            result, error = self._result, self._error
+            self._result = self._error = None
+            self._done = self._pending = False
+            return True, result, error
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            if self._result is not None:
+                self._result.release()
+                self._result = None
 
 
 def open_camera(preferred_source="auto"):
@@ -1226,6 +1299,14 @@ def main():
     cap = open_camera(args.camera)
     fps_time = time.monotonic()
     prev_frame_ts = fps_time
+    camera_switch = CameraSwitch()
+    signal_lost = False
+
+    def _request_camera_switch():
+        if not camera_switch.pending:
+            opener = open_webcam_local if getattr(cap, "is_ipcam", False) else open_ip_camera
+            print("[INFO] Conectando otra cámara en segundo plano...")
+            camera_switch.start(opener)
 
     def _reset_calibration_state(msg="[INFO] Recalibrando umbrales y cero postural 3D por 3 segundos..."):
         nonlocal is_calibrating, calib_elapsed_sec, eye_calib_elapsed_sec
@@ -1271,9 +1352,52 @@ def main():
         )
 
     while True:
+        switched, new_cap, switch_error = camera_switch.poll()
+        if switched:
+            if new_cap is not None:
+                cap.release()
+                cap = new_cap
+                last_face_box = None
+                persistence_sec = 0.0
+                ema_ear = ema_mar = ema_pitch = ema_roll = ema_yaw = None
+                sunglasses_timer = 0.0
+                sunglasses_active = False
+                prev_frame_ts = time.monotonic()
+                signal_lost = False
+                _reset_calibration_state("[INFO] Cámara cambiada -> Recalibrando 3 segundos...")
+            else:
+                print(f"[WARN] No se pudo cambiar de cámara: {switch_error or 'sin imagen'}. Se conserva la actual.")
         ret, frame = cap.read()
         if not ret:
-            break
+            if not getattr(cap, "is_ipcam", False):
+                break
+            # Sin un frame NUEVO no se evalúa fatiga ni se acumula calibración.
+            if cap.frame_age() > cap.timeout:
+                stop_alarm()
+                signal_lost = True
+                prev_frame_ts = time.monotonic()
+                waiting = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(waiting, "SIN SENAL FOSCAM | [v] Webcam | [q] Salir",
+                            (15, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 165, 255), 2)
+                if camera_switch.pending:
+                    cv2.putText(waiting, "Conectando otra camara...", (15, 270),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+                cv2.imshow(win_main, waiting)
+                cv2.imshow(win_det, waiting)
+            idle_key = cv2.waitKeyEx(10)
+            if idle_key != -1:
+                idle_key &= 0xFF
+                if idle_key in (ord("q"), 27):
+                    break
+                if idle_key == ord("v"):
+                    _request_camera_switch()
+            continue
+
+        if signal_lost:
+            signal_lost = False
+            last_face_box = None
+            ema_ear = ema_mar = ema_pitch = ema_roll = ema_yaw = None
+            _reset_calibration_state("[INFO] Señal Foscam recuperada -> Recalibrando...")
 
         now_ts = time.monotonic()
         frame_dt = min(max(now_ts - prev_frame_ts, 0.0), 0.25)
@@ -2082,6 +2206,9 @@ def main():
         )
 
         # Mostrar ambas vistas: monitor principal y detector de landmarks sobre imagen preprocesada
+        if camera_switch.pending:
+            cv2.putText(frame, "Conectando otra camara...", (10, 435),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         cv2.imshow(win_main, frame)
         cv2.imshow(win_det, face_frame)
 
@@ -2123,25 +2250,7 @@ def main():
             else:
                 print("[INFO] El control de LEDs IR ('n') solo está disponible con la cámara IP FI9820W.")
         elif key == ord("v"):
-            # Alternar en vivo entre la cámara IP FI9820W y la Webcam local
-            if getattr(cap, "is_ipcam", False):
-                new_cap = open_webcam_local(0)
-                if new_cap is not None:
-                    cap.release()
-                    cap = new_cap
-                    last_face_box = None
-                    _reset_calibration_state("[INFO] Cambiado a Webcam local -> Recalibrando 3 segundos...")
-                else:
-                    print("[WARN] No se encontró una Webcam local disponible.")
-            else:
-                new_cap = open_ip_camera()
-                if new_cap is not None:
-                    cap.release()
-                    cap = new_cap
-                    last_face_box = None
-                    _reset_calibration_state("[INFO] Cambiado a Cámara IP FI9820W -> Recalibrando 3 segundos...")
-                else:
-                    print("[WARN] No se pudo conectar a la Cámara IP FI9820W.")
+            _request_camera_switch()
         elif key == ord("g"):
             modes = ["AUTO", "ON", "OFF"]
             sunglasses_mode = modes[(modes.index(sunglasses_mode) + 1) % len(modes)]
@@ -2170,6 +2279,7 @@ def main():
         elif key == ord("c"):
             _reset_calibration_state()
 
+    camera_switch.close()
     stop_alarm()
     cap.release()
     cv2.destroyAllWindows()
