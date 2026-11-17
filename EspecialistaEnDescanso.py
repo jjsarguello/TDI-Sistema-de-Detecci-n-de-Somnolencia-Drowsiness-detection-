@@ -33,6 +33,49 @@ except Exception:
 ALARM_LOCK = threading.Lock()
 CURRENT_ALARM_PROC = [None]
 
+# ==============================================================================
+# ZONA DE CONFIGURACIÓN CENTRALIZADA DE ESTADOS, SENSIBILIDAD Y PERCLOS
+# Ajustá desde acá todos los valores de los 3 estados (Activo, Somnoliento, Peligro)
+# ==============================================================================
+CONFIG_DETECTOR = {
+    # --- 1. Ventana y umbrales de PERCLOS (%) y pesos de cada síntoma ---
+    "perclos_ventana_seg": 30.0,            # Ventana deslizante en segundos para calcular PERCLOS
+    "perclos_min_obs_seg": 5.0,             # Observación mínima tras calibrar antes de evaluar PERCLOS
+    "perclos_umbral_somnoliento_pct": 15.0, # >= 15% activa el MODO SOMNOLIENTO (Naranja, sin alarma sonora)
+    "perclos_umbral_peligro_pct": 25.0,     # >= 25% dispara PELIGRO + ALARMA (si cierra ojos o cabecea)
+    "perclos_peso_ojo_cerrado": 1.00,       # Peso (100%) que aporta tener los ojos cerrados a PERCLOS
+    "perclos_peso_ojo_entrecerrado": 0.25,  # Peso (25%) que aporta entrecerrar los ojos a PERCLOS
+    "perclos_peso_cabeceo": 0.70,           # Peso (70%) que aporta la cabeza caída/inclinada a PERCLOS
+    "perclos_bono_por_bostezo_pct": 10.0,   # % extra que suma cada bostezo confirmado al PERCLOS actual
+    "perclos_tope_bostezos_pct": 20.0,      # Tope máximo de % por bostezos (nunca llega a 25% por sí solo)
+
+    # --- 2. ESTADO 1: MODO ACTIVO (Conductor fresco -> Baja sensibilidad, tolerante) ---
+    "activo_ojos_peligro_seg": 1.15,        # Segundos de ojos cerrados para sonar alarma estando fresco
+    "activo_ojos_entrecerrados_seg": 0.65,  # Segundos de ojos entrecerrados para pasar a Modo Somnoliento
+    "activo_cabeceo_peligro_seg": 1.75,     # Segundos de caída de cabeza para sonar alarma estando fresco
+    "activo_cabeceo_sintoma_seg": 0.85,     # Segundos de cabeceo corto que activa Modo Somnoliento (sin alarma)
+    "activo_pitch_factor": 1.45,            # Caída vertical requerida en Modo Activo (145% de Pitch_0)
+    "activo_pitch_delta_min": 0.24,         # Incremento mínimo sobre Pitch_0 en Modo Activo
+    "activo_roll_grados": 24.0,             # Inclinación lateral permitida en Modo Activo (±24°)
+
+    # --- 3. ESTADO 2: MODO SOMNOLIENTO (Pre-alerta -> Alta sensibilidad a ojos y cabeceo) ---
+    "somnoliento_memoria_seg": 45.0,        # Segundos que dura el Modo Somnoliento tras un síntoma (bostezo/cabeceo)
+    "somnoliento_ojos_peligro_seg": 0.65,   # Segundos de ojos cerrados para sonar alarma estando somnoliento
+    "somnoliento_cabeceo_peligro_seg": 0.90,# Segundos de caída de cabeza para sonar alarma estando somnoliento
+    "somnoliento_pitch_factor": 1.28,       # Caída vertical requerida en Modo Somnoliento (128% de Pitch_0)
+    "somnoliento_pitch_delta_min": 0.16,    # Incremento mínimo sobre Pitch_0 en Modo Somnoliento
+    "somnoliento_roll_grados": 18.0,        # Inclinación lateral permitida en Modo Somnoliento (±18°)
+
+    # --- 4. Parámetros de Ojos (EAR), Bostezo (MAR) y Recuperación ---
+    "ear_factor_activo": 0.82,              # Proporción del EAR calibrado para considerar ojo bien abierto
+    "ear_factor_cerrado": 0.68,             # Proporción del EAR calibrado para considerar ojo cerrado
+    "bostezo_mar_umbral": 0.62,             # Apertura interna de boca (MAR) para detectar bostezo
+    "bostezo_duracion_seg": 1.35,           # Segundos con boca abierta para confirmar bostezo (NO dispara alarma)
+    "parpadeo_min_seg": 0.05,               # Duración mínima de cierre para contar 1 parpadeo
+    "recuperacion_activo_seg": 0.25,        # Segundos con ojos abiertos para recuperar estado / cortar alarma
+}
+# ==============================================================================
+
 
 def preprocess_gray_clahe(frame, clahe, use_clahe=True, face_box=None, target_lum=110.0):
     """
@@ -486,17 +529,39 @@ def classify_eye_state(ear, ear_active_thresh=0.25, ear_sleep_thresh=0.21):
         return 0
 
 
-def update_perclos(history, now_ts, is_closed, window_sec=30.0, min_obs_sec=5.0, max_frame_dt=0.5):
+def update_perclos(
+    history,
+    now_ts,
+    is_closed,
+    window_sec=30.0,
+    min_obs_sec=5.0,
+    max_frame_dt=0.5,
+    yawn_timestamps=None,
+    yawn_bonus_pct=0.0,
+    yawn_max_bonus_pct=20.0,
+):
     """
     Actualiza la ventana deslizante temporal y calcula PERCLOS (%) ponderado por duración real (dt):
-      1. Cada muestra aporta su duración real dt = min(t_i - t_{i-1}, max_frame_dt), eliminando
-         el sesgo por variaciones de FPS.
+      1. Cada muestra aporta su duración real dt = min(t_i - t_{i-1}, max_frame_dt) multiplicada por
+         el peso instantáneo de fatiga (1.0 para ojo cerrado, o pesos configurables para cabeceo y
+         ojo entrecerrado), eliminando el sesgo por variaciones de FPS.
       2. Exige un tiempo mínimo de observación efectiva (min_obs_sec, por defecto 5.0 s) tras la
          calibración para evitar que un único frame o parpadeo inicial dispare PERCLOS al 100%.
+      3. Si se pasan bostezos recientes (yawn_timestamps), cada bostezo dentro de la ventana suma
+         yawn_bonus_pct al porcentaje (con tope yawn_max_bonus_pct < 25% para activar el Modo
+         Somnoliento sin disparar la alarma sonora por sí solo).
     """
-    history.append((float(now_ts), 1 if is_closed else 0))
+    sample_weight = float(np.clip(float(is_closed), 0.0, 1.0))
+    history.append((float(now_ts), sample_weight))
     while history and (now_ts - history[0][0]) > window_sec:
         history.popleft()
+
+    yawn_bonus = 0.0
+    if yawn_timestamps is not None and yawn_bonus_pct > 0.0:
+        while yawn_timestamps and (now_ts - yawn_timestamps[0]) > window_sec:
+            yawn_timestamps.popleft()
+        yawn_bonus = min(len(yawn_timestamps) * float(yawn_bonus_pct), float(yawn_max_bonus_pct))
+
     if len(history) < 2:
         return 0.0
 
@@ -504,20 +569,21 @@ def update_perclos(history, now_ts, is_closed, window_sec=30.0, min_obs_sec=5.0,
     total_duration = 0.0
     for i in range(1, len(history)):
         t_prev, _ = history[i - 1]
-        t_curr, closed_curr = history[i]
+        t_curr, weight_curr = history[i]
         dt = t_curr - t_prev
         if dt <= 0.0:
             continue
         # Acotar dt máximo por si el rostro salió de cuadro y volvió segundos después
         dt = min(dt, max_frame_dt)
         total_duration += dt
-        if closed_curr:
-            closed_duration += dt
+        if weight_curr > 0.0:
+            closed_duration += dt * weight_curr
 
     if total_duration < min_obs_sec:
-        return 0.0
+        return float(min(100.0, yawn_bonus))
 
-    return (closed_duration / total_duration) * 100.0
+    base_perclos = (closed_duration / total_duration) * 100.0
+    return float(min(100.0, base_perclos + yawn_bonus))
 
 
 def ensure_alarm_wav(path="alarma.wav", sample_rate=44100):
@@ -739,35 +805,50 @@ def main():
     (m_start, m_end) = face_utils.FACIAL_LANDMARKS_IDXS["mouth"]
     (im_start, im_end) = face_utils.FACIAL_LANDMARKS_IDXS["inner_mouth"]
 
-    # Umbrales analíticos de EAR y duraciones en segundos reales con time.monotonic()
-    # (Independientes de los FPS de cada computadora)
-    ear_active_thresh = 0.25   # Por encima: Activo
-    ear_sleep_thresh = 0.21    # Por debajo: Ojos cerrados (entre 0.21 y 0.25: Somnoliento)
-    drowsy_thresh_sec = 0.40   # Segundos continuos para declarar fatiga inicial (~8-12 frames a 20-30 FPS)
-    sleep_thresh_sec = 0.75    # Segundos continuos para declarar sueño / disparar alarma (~15-22 frames)
-    active_thresh_sec = 0.25   # Segundos continuos para confirmar estado activo
+    # Umbrales analíticos inicializados desde la zona centralizada CONFIG_DETECTOR
+    ear_factor_activo = CONFIG_DETECTOR["ear_factor_activo"]
+    ear_factor_cerrado = CONFIG_DETECTOR["ear_factor_cerrado"]
+    ear_active_thresh = 0.25
+    ear_sleep_thresh = 0.21
+    drowsy_thresh_sec = CONFIG_DETECTOR["activo_ojos_entrecerrados_seg"]
+    sleep_thresh_sec = CONFIG_DETECTOR["activo_ojos_peligro_seg"]
+    active_thresh_sec = CONFIG_DETECTOR["recuperacion_activo_seg"]
 
-    # Umbral analítico de MAR (Mouth Aspect Ratio) y duración para bostezo
-    mar_yawn_thresh = 0.50     # Por encima de 0.50: boca ampliamente abierta
-    yawn_thresh_sec = 0.60     # Segundos continuos para distinguir bostezo de hablar
+    # Umbral analítico de MAR (Mouth Aspect Ratio) y duración para bostezo (síntoma, NO dispara alarma)
+    mar_yawn_thresh = CONFIG_DETECTOR["bostezo_mar_umbral"]
+    yawn_thresh_sec = CONFIG_DETECTOR["bostezo_duracion_seg"]
 
-    # Parámetros y ventana deslizante de PERCLOS (%)
-    perclos_window_sec = args.perclos_window
-    perclos_drowsy_thresh = 15.0  # >= 15% de cierre en la ventana -> Fatiga acumulada
-    perclos_sleep_thresh = 25.0   # >= 25% de cierre en la ventana -> Somnolencia severa
+    # Parámetros y ventana deslizante de PERCLOS (%) + aportes de cabeceo y bostezos
+    perclos_window_sec = args.perclos_window if args.perclos_window != 30.0 else CONFIG_DETECTOR["perclos_ventana_seg"]
+    perclos_min_obs_sec = CONFIG_DETECTOR["perclos_min_obs_seg"]
+    perclos_drowsy_thresh = CONFIG_DETECTOR["perclos_umbral_somnoliento_pct"]
+    perclos_sleep_thresh = CONFIG_DETECTOR["perclos_umbral_peligro_pct"]
+    peso_ojo_cerrado = CONFIG_DETECTOR["perclos_peso_ojo_cerrado"]
+    peso_ojo_entrecerrado = CONFIG_DETECTOR["perclos_peso_ojo_entrecerrado"]
+    peso_cabeceo = CONFIG_DETECTOR["perclos_peso_cabeceo"]
+    bono_bostezo_pct = CONFIG_DETECTOR["perclos_bono_por_bostezo_pct"]
+    tope_bostezos_pct = CONFIG_DETECTOR["perclos_tope_bostezos_pct"]
     perclos_history = deque()
+    yawn_timestamps = deque()
+    perclos = 0.0
 
-    # Umbrales analíticos de postura cefálica (cabeceo hacia abajo e inclinación lateral)
-    pitch_nod_thresh = 0.88       # Razón puente_nasal / nariz_mentón indicativa de cabeceo
-    roll_tilt_thresh = 16.0       # Inclinación lateral en grados (> 16° hacia un hombro)
-    head_thresh_sec = 0.55        # Segundos continuos para confirmar cabeceo / inclinación
+    # Estado del MODO SOMNOLIENTO (Estado 2: aumenta la sensibilidad a ojos cerrados y cabeceos)
+    somnoliento_memoria_seg = CONFIG_DETECTOR["somnoliento_memoria_seg"]
+    drowsy_mode_until = -1e9
+    drowsy_mode_active = False
+
+    # Umbrales analíticos de postura cefálica (dinámicos según esté en Modo Activo o Modo Somnoliento)
+    pitch_nod_thresh = 1.00
+    roll_tilt_thresh = CONFIG_DETECTOR["activo_roll_grados"]
+    head_thresh_sec = CONFIG_DETECTOR["activo_cabeceo_peligro_seg"]
+    head_symptom_sec = CONFIG_DETECTOR["activo_cabeceo_sintoma_seg"]
 
     sleep_duration = 0.0
     drowsy_duration = 0.0
     active_duration = 0.0
 
-    # Contador de parpadeos (transición de ojo cerrado >= 0.05s a ojo abierto)
-    blink_min_sec = 0.05
+    # Contador de parpadeos (transición de ojo cerrado >= parpadeo_min_seg a ojo abierto)
+    blink_min_sec = CONFIG_DETECTOR["parpadeo_min_seg"]
     blink_duration = 0.0
     total_blinks = 0
 
@@ -1071,7 +1152,6 @@ def main():
             # Extraer boca y calcular MAR instantáneo (Mouth Aspect Ratio) con el labio interno
             mouth = landmarks[m_start:m_end]
             inner_mouth = landmarks[im_start:im_end]
-            mar_raw = mouth_aspect_ratio(inner_mouth)
 
             # Calcular postura cefálica instantánea en 3 ejes: Roll, Pitch y Yaw (giro lateral)
             (
@@ -1082,6 +1162,9 @@ def main():
                 pt_nose,
                 pt_chin,
             ) = compute_head_pose_metrics(landmarks)
+
+            # Compensar escorzo horizontal de la boca cuando gira la cabeza (Yaw) para no inflar MAR al hablar de costado
+            mar_raw = mouth_aspect_ratio(inner_mouth) * max(0.75, 1.0 - 0.35 * abs(yaw_raw))
 
             # Calcular EAR instantáneo con calibración independiente por ojo y compensación por giro (Yaw)
             ear_raw = compute_perspective_compensated_ear(
@@ -1168,15 +1251,26 @@ def main():
                         left_ear_base = float(np.median(calib_left_ears))
                         right_ear_base = float(np.median(calib_right_ears))
                         ear_base = 0.5 * (left_ear_base + right_ear_base)
-                        ear_active_thresh = round(ear_base * 0.82, 3)
-                        ear_sleep_thresh = round(ear_base * 0.70, 3)
+                        ear_active_thresh = round(ear_base * ear_factor_activo, 3)
+                        ear_sleep_thresh = round(ear_base * ear_factor_cerrado, 3)
                     pitch_base = float(np.median(calib_pitches))
                     roll_base = float(np.median(calib_rolls))
                     yaw_base = float(np.median(calib_yaws))
-                    pitch_nod_thresh = round(pitch_base * 1.25, 3)
+                    pitch_nod_thresh = round(
+                        max(
+                            pitch_base * CONFIG_DETECTOR["activo_pitch_factor"],
+                            pitch_base + CONFIG_DETECTOR["activo_pitch_delta_min"],
+                            0.94,
+                        ),
+                        3,
+                    )
 
                     is_calibrating = False
                     perclos_history.clear()
+                    yawn_timestamps.clear()
+                    perclos = 0.0
+                    drowsy_mode_until = -1e9
+                    drowsy_mode_active = False
                     sleep_duration = drowsy_duration = active_duration = 0.0
                     yawn_duration = head_duration = blink_duration = 0.0
                     yawn_counted = nod_counted = False
@@ -1195,21 +1289,116 @@ def main():
                         left_ear_base = float(np.median(calib_left_ears))
                         right_ear_base = float(np.median(calib_right_ears))
                         ear_base = 0.5 * (left_ear_base + right_ear_base)
-                        ear_active_thresh = round(ear_base * 0.82, 3)
-                        ear_sleep_thresh = round(ear_base * 0.70, 3)
+                        ear_active_thresh = round(ear_base * ear_factor_activo, 3)
+                        ear_sleep_thresh = round(ear_base * ear_factor_cerrado, 3)
                         print(
                             f"[INFO] Auto-calibración ocular diferida completada (sin lentes) -> "
                             f"EAR_L0={left_ear_base:.3f}, EAR_R0={right_ear_base:.3f} | "
                             f"Umb EAR: {ear_active_thresh:.3f}/{ear_sleep_thresh:.3f}"
                         )
 
+            # Determinar si está en MODO SOMNOLIENTO (Estado 2: mayor sensibilidad ante cabeceos y cierre ocular)
+            drowsy_mode_active = (not is_calibrating) and (
+                (now_ts < drowsy_mode_until) or (perclos >= perclos_drowsy_thresh)
+            )
+            if drowsy_mode_active:
+                sleep_thresh_sec = CONFIG_DETECTOR["somnoliento_ojos_peligro_seg"]
+                head_thresh_sec = CONFIG_DETECTOR["somnoliento_cabeceo_peligro_seg"]
+                roll_tilt_thresh = CONFIG_DETECTOR["somnoliento_roll_grados"]
+                if pitch_base is not None:
+                    pitch_nod_thresh = round(
+                        max(
+                            pitch_base * CONFIG_DETECTOR["somnoliento_pitch_factor"],
+                            pitch_base + CONFIG_DETECTOR["somnoliento_pitch_delta_min"],
+                            0.88,
+                        ),
+                        3,
+                    )
+                else:
+                    pitch_nod_thresh = 0.92
+            else:
+                sleep_thresh_sec = CONFIG_DETECTOR["activo_ojos_peligro_seg"]
+                head_thresh_sec = CONFIG_DETECTOR["activo_cabeceo_peligro_seg"]
+                roll_tilt_thresh = CONFIG_DETECTOR["activo_roll_grados"]
+                if pitch_base is not None:
+                    pitch_nod_thresh = round(
+                        max(
+                            pitch_base * CONFIG_DETECTOR["activo_pitch_factor"],
+                            pitch_base + CONFIG_DETECTOR["activo_pitch_delta_min"],
+                            0.94,
+                        ),
+                        3,
+                    )
+                else:
+                    pitch_nod_thresh = 1.00
+
             # Desviaciones posturales respecto al "cero relativo" calibrado (soporta cámara en diagonal)
             delta_roll = roll_deg - roll_base
             delta_yaw = yaw_ratio - yaw_base
             head_anomaly = (pitch_ratio > pitch_nod_thresh) or (abs(delta_roll) > roll_tilt_thresh)
 
-            # Si se detectan LENTES DE SOL: ignorar medición ocular (EAR / PERCLOS)
-            # y tomar como válidas únicamente la posición del rostro (Pitch/dRoll) y el bostezo (MAR)
+            # 1. Evaluación temporal de BOSTEZO (MAR): es SÍNTOMA de somnolencia (suma a PERCLOS y activa
+            #    el Modo Somnoliento), pero NUNCA dispara la alarma sonora por sí solo.
+            mouth_color = (255, 0, 0)  # Azul por defecto
+            if not is_calibrating and mar > mar_yawn_thresh:
+                yawn_duration += frame_dt
+                mouth_color = (0, 165, 255)  # Naranja mientras abre la boca
+                if yawn_duration >= yawn_thresh_sec:
+                    mouth_color = (0, 140, 255)  # Naranja intenso al confirmar síntoma de bostezo
+                    if not yawn_counted:
+                        total_yawns += 1
+                        yawn_counted = True
+                        yawn_timestamps.append(now_ts)
+                        drowsy_mode_until = max(
+                            drowsy_mode_until, now_ts + somnoliento_memoria_seg
+                        )
+                    cv2.putText(
+                        frame,
+                        "SINTOMA: BOSTEZO (+PERCLOS / Modo Somnoliento)",
+                        (10, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.62,
+                        (0, 165, 255),
+                        2,
+                    )
+            else:
+                yawn_duration = 0.0
+                yawn_counted = False
+
+            # 2. Evaluación temporal de CABECEO (Pitch) e INCLINACIÓN LATERAL (Roll)
+            axis_color = (255, 255, 0)  # Cian por defecto para el eje facial
+            if not is_calibrating and head_anomaly:
+                head_duration += frame_dt
+                axis_color = (0, 165, 255)  # Naranja mientras empieza a inclinar/cabecear
+                # Si cabecea un tiempo intermedio, activa el Modo Somnoliento aunque todavía no llegue al peligro
+                if head_duration >= head_symptom_sec:
+                    drowsy_mode_until = max(
+                        drowsy_mode_until, now_ts + somnoliento_memoria_seg
+                    )
+                if head_duration >= head_thresh_sec:
+                    axis_color = (0, 0, 255)  # Rojo al confirmar postura de peligro
+                    if not nod_counted:
+                        total_nods += 1
+                        nod_counted = True
+                    head_alert_msg = (
+                        "PELIGRO: CABECEO DETECTADO!"
+                        if pitch_ratio > pitch_nod_thresh
+                        else "PELIGRO: INCLINACION LATERAL!"
+                    )
+                    cv2.putText(
+                        frame,
+                        head_alert_msg,
+                        (10, 105),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.72,
+                        (0, 0, 255),
+                        2,
+                    )
+            else:
+                head_duration = 0.0
+                nod_counted = False
+
+            # 3. Evaluación ocular (EAR) e integración unificada de PERCLOS (ojos + cabeceo + bostezos)
             if sunglasses_active:
                 eye_state = 2
                 eye_closed_raw = False
@@ -1217,28 +1406,14 @@ def main():
                 sleep_duration = 0.0
                 drowsy_duration = 0.0
                 blink_duration = 0.0
-                perclos = 0.0
-                if not is_calibrating:
-                    if head_duration >= head_thresh_sec:
-                        status = "SOMNOLENCIA (POSTURA)!"
-                        status_color = (0, 0, 255)
-                    elif yawn_duration >= yawn_thresh_sec:
-                        status = "FATIGA (BOSTEZO)!"
-                        status_color = (0, 0, 255)
-                    elif head_anomaly or mar > mar_yawn_thresh:
-                        status = "Atencion (Postura/Boca)"
-                        status_color = (0, 165, 255)
-                    else:
-                        status = "Activo [Lentes de Sol]"
-                        status_color = (0, 255, 0)
+                eye_w = 0.0
             else:
-                # Clasificar apertura ocular para fatiga/sueño (con EAR suavizado o crudo según 'f')
                 eye_state = classify_eye_state(ear, ear_active_thresh, ear_sleep_thresh)
-                # Para el contador de parpadeos usamos SIEMPRE ear_raw (instantáneo) para no perder parpadeos rápidos
-                eye_closed_raw = classify_eye_state(ear_raw, ear_active_thresh, ear_sleep_thresh) == 0
-                eye_closed = (eye_state == 0)
+                eye_closed_raw = (
+                    classify_eye_state(ear_raw, ear_active_thresh, ear_sleep_thresh) == 0
+                )
+                eye_closed = eye_state == 0
 
-                # Conteo de parpadeos y actualización de PERCLOS en segundos reales
                 if not is_calibrating:
                     if eye_closed_raw:
                         blink_duration += frame_dt
@@ -1247,12 +1422,6 @@ def main():
                             total_blinks += 1
                         blink_duration = 0.0
 
-                    perclos = update_perclos(perclos_history, now_ts, eye_closed, perclos_window_sec)
-                else:
-                    perclos = 0.0
-
-                # Evaluación temporal en segundos reales (time.monotonic) combinando cierre continuo y PERCLOS
-                if not is_calibrating:
                     if eye_closed:
                         sleep_duration += frame_dt
                         drowsy_duration = 0.0
@@ -1261,98 +1430,83 @@ def main():
                         sleep_duration = 0.0
                         active_duration = 0.0
                         drowsy_duration += frame_dt
+                        if drowsy_duration >= drowsy_thresh_sec:
+                            drowsy_mode_until = max(
+                                drowsy_mode_until, now_ts + somnoliento_memoria_seg
+                            )
                     else:
                         drowsy_duration = 0.0
                         sleep_duration = 0.0
                         active_duration += frame_dt
 
-                    # La alarma ocular suena si hay cierre sostenido actual (sleep_duration >= sleep_thresh_sec)
-                    # o si PERCLOS es crítico MIENTRAS los ojos siguen cerrados/entrecerrados (eye_state < 2).
-                    # Apenas el conductor abre bien los ojos (eye_state == 2), la alarma se detiene.
-                    if sleep_duration >= sleep_thresh_sec or (
-                        perclos >= perclos_sleep_thresh and eye_state < 2
-                    ):
-                        status = (
-                            "DURMIENDO !!!"
-                            if sleep_duration >= sleep_thresh_sec
-                            else "SOMNOLENCIA (PERCLOS)!"
-                        )
-                        status_color = (0, 0, 255)  # Rojo en BGR
-                        _maybe_trigger_alarm(now_ts)
+                eye_w = (
+                    peso_ojo_cerrado
+                    if eye_closed
+                    else (peso_ojo_entrecerrado if eye_state == 1 else 0.0)
+                )
 
-                    elif drowsy_duration >= drowsy_thresh_sec or (
-                        perclos >= perclos_drowsy_thresh and eye_state < 2
-                    ):
-                        status = "Somnoliento (Fatiga) !"
-                        status_color = (0, 165, 255)  # Naranja en BGR
-
-                    else:
-                        if active_duration >= active_thresh_sec:
-                            status = "Activo :)"
-                            status_color = (0, 255, 0)  # Verde en BGR
-
-            # Evaluación temporal de bostezo mediante MAR en segundos reales (suspendida durante calibración)
-            mouth_color = (255, 0, 0)  # Azul por defecto
-            if not is_calibrating and mar > mar_yawn_thresh:
-                yawn_duration += frame_dt
-                mouth_color = (0, 165, 255)  # Naranja mientras abre la boca
-                if yawn_duration >= yawn_thresh_sec:
-                    mouth_color = (0, 0, 255)  # Rojo al confirmar bostezo
-                    if not yawn_counted:
-                        total_yawns += 1
-                        yawn_counted = True
-                    cv2.putText(
-                        frame,
-                        "ALERTA: BOSTEZO DETECTADO!",
-                        (10, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.75,
-                        (0, 0, 255),
-                        2,
+            if not is_calibrating:
+                head_w = peso_cabeceo if head_anomaly else 0.0
+                instant_fatigue_weight = min(1.0, max(eye_w, head_w))
+                perclos = update_perclos(
+                    perclos_history,
+                    now_ts,
+                    instant_fatigue_weight,
+                    window_sec=perclos_window_sec,
+                    min_obs_sec=perclos_min_obs_sec,
+                    yawn_timestamps=yawn_timestamps,
+                    yawn_bonus_pct=bono_bostezo_pct,
+                    yawn_max_bonus_pct=tope_bostezos_pct,
+                )
+                if perclos >= perclos_drowsy_thresh:
+                    drowsy_mode_until = max(
+                        drowsy_mode_until, now_ts + 5.0
                     )
-                    _maybe_trigger_alarm(now_ts)
+                drowsy_mode_active = (now_ts < drowsy_mode_until) or (
+                    perclos >= perclos_drowsy_thresh
+                )
             else:
-                yawn_duration = 0.0
-                yawn_counted = False
+                perclos = 0.0
+                drowsy_mode_active = False
 
-            # Evaluación temporal de cabeceo (Pitch) e inclinación lateral (Roll) (suspendida durante calibración)
-            axis_color = (255, 255, 0)  # Cian por defecto para el eje facial
-            if not is_calibrating and head_anomaly:
-                head_duration += frame_dt
-                axis_color = (0, 165, 255)  # Naranja mientras empieza a inclinar/cabecear
-                if head_duration >= head_thresh_sec:
-                    axis_color = (0, 0, 255)  # Rojo al confirmar postura anómala
-                    if not nod_counted:
-                        total_nods += 1
-                        nod_counted = True
-                    head_alert_msg = (
-                        "ALERTA: CABECEO DETECTADO!"
-                        if pitch_ratio > pitch_nod_thresh
-                        else "ALERTA: INCLINACION LATERAL!"
-                    )
-                    cv2.putText(
-                        frame,
-                        head_alert_msg,
-                        (10, 105),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.75,
-                        (0, 0, 255),
-                        2,
-                    )
-                    _maybe_trigger_alarm(now_ts)
-            else:
-                head_duration = 0.0
-                nod_counted = False
-
-            # Si está calibrando o el conductor ya se despertó (ojos abiertos, sin bostezo ni cabeceo activo),
-            # cortar de inmediato cualquier sonido de alarma que estuviera reproduciéndose
-            eye_alarm_active = (not is_calibrating) and (not sunglasses_active) and (
+            # 4. Máquina de 3 Estados (1: ACTIVO | 2: MODO SOMNOLIENTO | 3: PELIGRO + ALARMA)
+            eye_danger = (not is_calibrating) and (not sunglasses_active) and (
                 sleep_duration >= sleep_thresh_sec
                 or (perclos >= perclos_sleep_thresh and eye_state < 2)
             )
-            yawn_alarm_active = (not is_calibrating) and (yawn_duration >= yawn_thresh_sec)
-            head_alarm_active = (not is_calibrating) and (head_duration >= head_thresh_sec)
-            if not (eye_alarm_active or yawn_alarm_active or head_alarm_active):
+            head_danger = (not is_calibrating) and (
+                head_duration >= head_thresh_sec
+                or (perclos >= perclos_sleep_thresh and head_anomaly)
+            )
+
+            if not is_calibrating:
+                if eye_danger or head_danger:
+                    if sleep_duration >= sleep_thresh_sec:
+                        status = "PELIGRO: DURMIENDO !!!"
+                    elif head_duration >= head_thresh_sec:
+                        status = "PELIGRO: CABECEO CRITICO!"
+                    else:
+                        status = "PELIGRO: SOMNOLENCIA (PERCLOS)!"
+                    status_color = (0, 0, 255)  # Rojo en BGR
+                    _maybe_trigger_alarm(now_ts)
+                elif drowsy_mode_active or head_anomaly or mar > mar_yawn_thresh:
+                    status = (
+                        "MODO SOMNOLIENTO [Lentes] !"
+                        if sunglasses_active
+                        else "MODO SOMNOLIENTO (Fatiga) !"
+                    )
+                    status_color = (0, 165, 255)  # Naranja en BGR (sin alarma sonora)
+                    stop_alarm()
+                else:
+                    if sunglasses_active or active_duration >= active_thresh_sec:
+                        status = (
+                            "Activo [Lentes de Sol]"
+                            if sunglasses_active
+                            else "Activo :)"
+                        )
+                        status_color = (0, 255, 0)  # Verde en BGR
+                    stop_alarm()
+            else:
                 stop_alarm()
 
             # Visualización de contornos de ojos (violeta si usa lentes de sol, o verde según ojo expuesto)
@@ -1435,25 +1589,21 @@ def main():
                 2,
             )
 
-            # Color dinámico e indicador visual para PERCLOS
-            if sunglasses_active:
-                perclos_color = (180, 180, 180)
-                perclos_text = "PERCLOS: Pausado"
+            # Color dinámico e indicador visual para PERCLOS (integra ojos + cabeceos + bostezos)
+            if perclos >= perclos_sleep_thresh:
+                perclos_color = (0, 0, 255)
+            elif perclos >= perclos_drowsy_thresh:
+                perclos_color = (0, 165, 255)
             else:
-                if perclos >= perclos_sleep_thresh:
-                    perclos_color = (0, 0, 255)
-                elif perclos >= perclos_drowsy_thresh:
-                    perclos_color = (0, 165, 255)
-                else:
-                    perclos_color = (0, 255, 0)
-                perclos_text = f"PERCLOS: {perclos:.1f}%"
+                perclos_color = (0, 255, 0)
+            perclos_text = f"PERCLOS: {perclos:.1f}%"
 
             cv2.putText(
                 frame,
                 perclos_text,
-                (435 if sunglasses_active else 450, 125),
+                (450, 125),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55 if sunglasses_active else 0.65,
+                0.65,
                 perclos_color,
                 2,
             )
@@ -1524,6 +1674,21 @@ def main():
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
                 (200, 200, 200),
+                1,
+            )
+            sens_text = (
+                "Sensib: ALTA (Somnoliento)"
+                if drowsy_mode_active
+                else "Sensib: Normal (Activo)"
+            )
+            sens_color = (0, 165, 255) if drowsy_mode_active else (180, 230, 180)
+            cv2.putText(
+                frame,
+                sens_text,
+                (415, 318),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                sens_color,
                 1,
             )
 
@@ -1637,6 +1802,11 @@ def main():
             calib_pitches.clear()
             calib_rolls.clear()
             calib_yaws.clear()
+            perclos_history.clear()
+            yawn_timestamps.clear()
+            perclos = 0.0
+            drowsy_mode_until = -1e9
+            drowsy_mode_active = False
             sleep_duration = drowsy_duration = active_duration = 0.0
             yawn_duration = head_duration = blink_duration = 0.0
             yawn_counted = nod_counted = False

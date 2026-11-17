@@ -101,11 +101,13 @@ D) DETECCIÓN DE BOSTEZOS: mouth_aspect_ratio() (MÉTRICA MAR)
    * ¿Cuál es su utilidad?
      Permite detectar bostezos (síntoma temprano clave de somnolencia) de forma
      puramente geométrica y liviana, sin necesitar redes neuronales pesadas (.h5).
-     Al exigir que MAR > 0.50 se mantenga durante un tiempo real continuo de
-     0.60 segundos (yawn_thresh_sec, medido con reloj monotónico time.monotonic()
-     independientemente de los FPS de la computadora), distingue perfectamente
-     entre hablar normal y bostezar, incrementando el contador de "Bostezos" y
-     disparando una alerta.
+     Al exigir que MAR > 0.62 (compensado por escorzo lateral Yaw) se mantenga
+     durante 1.35 segundos continuos (medido con time.monotonic()), distingue
+     perfectamente entre hablar normal y bostezar. Como un bostezo es un síntoma
+     previo y no quedarse dormido, NUNCA dispara la alarma sonora por sí solo:
+     suma un bono configurable (+10% por bostezo, con tope de 20%) al PERCLOS y
+     activa el "Modo Somnoliento" (mayor sensibilidad ante cabeceos y cierre de
+     ojos durante los siguientes 45 segundos).
 
 
 E) POSTURA CEFÁLICA EN 3 EJES, COMPENSACIÓN POR OJO Y PERSISTENCIA LATERAL:
@@ -114,14 +116,15 @@ E) POSTURA CEFÁLICA EN 3 EJES, COMPENSACIÓN POR OJO Y PERSISTENCIA LATERAL:
    * ¿Qué hace?
      1. Roll (Inclinación lateral relativa en grados, dRoll = Roll - Roll_0):
         calcula el ángulo de la línea que une el centro de ambos ojos respecto
-        al ángulo base de calibración (Roll_0). Si |dRoll| supera ±16°, detecta
-        que la cabeza cayó hacia un hombro sin importar si la cámara está en el
-        parante o tablero.
+        al ángulo base de calibración (Roll_0). Si |dRoll| supera ±23° durante
+        al menos 1.35 segundos, detecta que la cabeza cayó hacia un hombro sin
+        importar si la cámara está en el parante o tablero.
      2. Pitch (Cabeceo vertical relativo a Pitch_0): calcula la razón proyectiva
         entre el largo del puente nasal (entrecejo p27 a punta de nariz p30) y la
         distancia nariz-mentón (p30 a p8). Al cabecear hacia adelante/abajo, la
         distancia nariz-mentón se acorta en la proyección 2D de la cámara y el
-        ratio supera el 125% de Pitch_0, disparando la alerta de cabeceo.
+        ratio supera max(142% de Pitch_0, Pitch_0 + 0.22, 0.92) durante >= 1.35 s,
+        disparando la alerta de cabeceo sin falsos positivos al mirar el tablero.
      3. Yaw (Giro lateral del cuello y desvío dYaw = Yaw - Yaw_0): compara el
         ancho visible izquierdo vs. derecho del rostro desde la nariz (p30) hacia
         los bordes de la mandíbula (p0 y p16).
@@ -195,8 +198,8 @@ G) CALIBRACIÓN BIOMÉTRICA EN 3 SEGUNDOS EFECTIVOS, SUSPENSIÓN DE ALERTAS Y
        medio normalizado:
          * Umbral Activo (ear_active_thresh) = 82% de EAR_base
          * Umbral Ojo Cerrado (ear_sleep_thresh) = 70% de EAR_base
-         * Umbral de Cabeceo (pitch_nod_thresh) = 125% de Pitch_0 (durante >= 0.55s)
-         * Umbral de Inclinación Lateral = |Roll - Roll_0| > 16° (durante >= 0.55s)
+         * Umbral de Cabeceo (pitch_nod_thresh) = max(142% de Pitch_0, Pitch_0 + 0.22, 0.92) (durante >= 1.35s)
+         * Umbral de Inclinación Lateral = |Roll - Roll_0| > 23° (durante >= 1.35s)
      - Todos los estados se confirman por duración real con time.monotonic():
          * Microsueño / Cierre ocular continuo: >= 0.75 s (sleep_thresh_sec)
          * Fatiga ocular / Entrecerrado: >= 0.40 s (drowsy_thresh_sec)
@@ -210,28 +213,37 @@ G) CALIBRACIÓN BIOMÉTRICA EN 3 SEGUNDOS EFECTIVOS, SUSPENSIÓN DE ALERTAS Y
      computadora y fisonomía.
 
 
-H) MÉTRICA TEMPORAL ESTÁNDAR PERCLOS PONDERADA POR DURACIÓN: update_perclos()
+H) MÁQUINA DE 3 ESTADOS ADAPTATIVA (ACTIVO, SOMNOLIENTO, PELIGRO) Y PERCLOS
+   INTEGRADO: CONFIG_DETECTOR y update_perclos()
    -----------------------------------------------------------------------------
    * ¿Qué hace?
-     Mantiene una ventana temporal deslizante de los últimos 30 segundos
-     (configurable con --perclos-window) mediante una cola (collections.deque)
-     con marcas de tiempo monotónicas. En lugar de contar muestras (lo cual
-     sesgaría el porcentaje si varían los FPS), pondera cada muestra por su
-     duración real dt = min(t_i - t_{i-1}, 0.5s):
-         PERCLOS (%) = (Tiempo cerrado acumulado / Tiempo total observado) * 100
-     Además, exige un tiempo mínimo de observación efectiva de 5.0 segundos
-     (min_obs_sec = 5.0) tras la calibración antes de reportar valores no nulos,
-     evitando que un único parpadeo recién terminada la calibración dispare el
-     PERCLOS al 100%.
-
-   * ¿Cuál es su utilidad?
-     Cumple rigurosamente con el estándar exigido en la consigna:
-     - El acumulador continuo (0.75 s) detecta un MICROSUEÑO (cerrar los ojos de
-       corrido).
-     - PERCLOS detecta la FATIGA ACUMULADA en la ventana de 30 s:
-         * PERCLOS < 15% y ojos abiertos        -> Estado: "Activo :)" (Verde)
-         * 15% <= PERCLOS < 25% o entrecerrado  -> Estado: "Somnoliento (Fatiga) !" (Naranja)
-         * PERCLOS >= 25% o cierre continuo     -> Estado: "DURMIENDO / SOMNOLENCIA!" (Rojo + Alarma)
+     1. Todos los umbrales de los 3 estados están centralizados al inicio del
+        archivo en el diccionario "CONFIG_DETECTOR" (líneas 40-82) para poder
+        ajustarlos desde un único lugar.
+     2. PERCLOS ponderado por duración e integrado con postura y bostezos:
+        Mantiene una ventana deslizante de 30 segundos ponderada por dt real
+        (con observación mínima de 5.0 s tras calibrar) donde aportan:
+          * Ojos cerrados: peso 1.00 (100% del dt)
+          * Cabeceo / inclinación de cabeza: peso 0.70 (70% del dt)
+          * Ojos entrecerrados: peso 0.25 (25% del dt)
+          * Bostezos confirmados en la ventana: +10% por bostezo (con tope máximo
+            de 20% para que bostezar por sí solo active el Modo Somnoliento pero
+            nunca dispare la alarma crítica de >= 25%).
+     3. Tres estados con sensibilidad dinámica:
+          * ESTADO 1 - ACTIVO (Verde, Sensibilidad Normal/Tolerante):
+            Sin síntomas recientes (PERCLOS < 15%). Evita falsas alarmas al
+            hablar o mover la cabeza: exige 1.15 s de ojos cerrados o 1.75 s de
+            caída de cabeza pronunciada (145% Pitch_0 o ±24° Roll) para sonar.
+          * ESTADO 2 - MODO SOMNOLIENTO (Naranja, Pre-alerta sin sonido, Alta
+            Sensibilidad):
+            Se activa durante 45 segundos tras un bostezo, un cabeceo corto
+            (>= 0.85 s), ojos entrecerrados (>= 0.65 s) o PERCLOS >= 15%. En este
+            modo el sistema vigila más de cerca y reduce los umbrales de peligro
+            a 0.65 s para ojos cerrados y 0.90 s para cabeceo (128% Pitch_0 o
+            ±18° Roll).
+          * ESTADO 3 - PELIGRO: DURMIENDO / CABECEO CRÍTICO (Rojo + Alarma):
+            Único estado que dispara la alarma sonora periódica, ante microsueño,
+            cabeceo sostenido o PERCLOS >= 25% mientras cierra los ojos o cabecea.
 
 
 I) ALARMA SONORA PERIÓDICA CON CORTE INMEDIATO AL DESPERTAR:
